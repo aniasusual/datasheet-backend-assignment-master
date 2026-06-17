@@ -30,11 +30,9 @@ class DocumentPageResponse(BaseModel):
     raw_text: str
     layout_text: str | None
     tables_json: list | None
-    image_path: str
     width: float
     height: float
     extraction_quality: str
-    page_type: str
 
     model_config = {"from_attributes": True}
 

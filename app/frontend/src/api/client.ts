@@ -29,7 +29,9 @@ import type {
   ExtractedField,
   EquipmentEntity,
   ExtractionResult,
+  ExtractionStatus,
   QueryResult,
+  AgentResponse,
   FieldStatus,
 } from '../types';
 
@@ -66,8 +68,8 @@ export const api = {
   getDocument: (sessionId: string, docId: string) =>
     request<DocumentDetail>(`/sessions/${sessionId}/documents/${docId}`),
 
-  getPageImageUrl: (sessionId: string, docId: string, pageNum: number) =>
-    `${BASE}/sessions/${sessionId}/documents/${docId}/pages/${pageNum}/image`,
+  getDocumentPdfUrl: (sessionId: string, docId: string) =>
+    `${BASE}/sessions/${sessionId}/documents/${docId}/pdf`,
 
   // Extraction
   extractDocument: (sessionId: string, docId: string) =>
@@ -77,15 +79,25 @@ export const api = {
     ),
 
   extractAll: (sessionId: string) =>
-    request<{ status: string; documents_processed: number; results: ExtractionResult[] }>(
+    request<{ status: string; documents_queued: number; message: string }>(
       `/sessions/${sessionId}/documents/extract-all`,
       { method: 'POST' }
+    ),
+
+  getExtractionStatus: (sessionId: string) =>
+    request<ExtractionStatus>(
+      `/sessions/${sessionId}/documents/extraction-status`
     ),
 
   reExtractDocument: (sessionId: string, docId: string) =>
     request<ExtractionResult>(
       `/sessions/${sessionId}/documents/${docId}/re-extract`,
       { method: 'POST' }
+    ),
+
+  getExtractionReport: (sessionId: string) =>
+    request<{ report: string; raw: unknown }>(
+      `/sessions/${sessionId}/documents/extraction-report`
     ),
 
   // Fields
@@ -151,5 +163,12 @@ export const api = {
     request<QueryResult>(`/sessions/${sessionId}/query`, {
       method: 'POST',
       body: JSON.stringify({ question }),
+    }),
+
+  // Agent
+  agentChat: (sessionId: string, messages: { role: string; content: string }[], message: string) =>
+    request<AgentResponse>(`/sessions/${sessionId}/agent`, {
+      method: 'POST',
+      body: JSON.stringify({ messages, message }),
     }),
 };

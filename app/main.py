@@ -8,9 +8,8 @@ from app.config import settings
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: ensure upload/render dirs exist
+    # Startup: ensure upload dir exists
     settings.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    settings.RENDERED_PAGES_DIR.mkdir(parents=True, exist_ok=True)
     yield
     # Shutdown: cleanup if needed
 

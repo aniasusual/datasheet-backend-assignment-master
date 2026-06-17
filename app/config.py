@@ -16,10 +16,6 @@ class Settings(BaseSettings):
 
     # File storage
     UPLOAD_DIR: Path = Path("./uploads")
-    RENDERED_PAGES_DIR: Path = Path("./rendered_pages")
-
-    # Rendering
-    RENDER_DPI: int = 300
 
     # Accepted file types
     ACCEPTED_EXTENSIONS: set[str] = {".pdf"}

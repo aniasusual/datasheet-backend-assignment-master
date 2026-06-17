@@ -46,11 +46,9 @@ export interface DocumentPage {
   raw_text: string;
   layout_text: string | null;
   tables_json: unknown[] | null;
-  image_path: string;
   width: number;
   height: number;
   extraction_quality: string;
-  page_type: string;
 }
 
 export interface DocumentDetail extends Document {
@@ -148,6 +146,44 @@ export interface ExtractionResult {
   fields_extracted: number;
   corrections_applied?: number;
   entity: { id: string; tag: string; name: string } | null;
+}
+
+// Agent
+export interface AgentMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface ToolAction {
+  tool: string;
+  args: Record<string, unknown>;
+  result: Record<string, unknown>;
+}
+
+export interface AgentResponse {
+  response: string;
+  messages: AgentMessage[];
+  tool_actions: ToolAction[];
+}
+
+// Extraction progress
+export interface DocumentExtractionProgress {
+  document_id: string;
+  filename: string;
+  total_pages: number;
+  current_page: number;
+  phase: 'queued' | 'discovery' | 'extracting_values' | 'verifying' | 'post_processing' | 'done' | 'failed';
+  fields_extracted: number;
+  error: string | null;
+}
+
+export interface ExtractionStatus {
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  message?: string;
+  total_documents?: number;
+  documents_completed?: number;
+  elapsed_seconds?: number;
+  documents?: Record<string, DocumentExtractionProgress>;
 }
 
 // Section labels

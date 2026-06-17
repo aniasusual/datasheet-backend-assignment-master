@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import uuid
 from pathlib import Path
 
@@ -11,7 +13,7 @@ from app.models.extracted_field import ExtractedField, FieldStatus
 from app.models.field_correction import FieldCorrection
 
 from app.config import settings
-from app.database import get_db
+from app.database import get_db, async_session_factory
 from app.models.document import Document, DocumentStatus
 from app.models.document_page import DocumentPage
 from app.models.session import Session
@@ -22,6 +24,17 @@ from app.schemas.documents import (
     DocumentUploadResponse,
 )
 from app.services.document_processor import process_document, detect_file_type
+from app.services.extraction_progress import (
+    ExtractionPhase,
+    start_session as start_progress,
+    update_document as update_doc_progress,
+    mark_document_done,
+    mark_document_failed,
+    finish_session,
+    get_progress,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions/{session_id}/documents", tags=["documents"])
 
@@ -213,15 +226,66 @@ async def re_extract_document(
     }
 
 
+async def _run_extraction_background(session_id: uuid.UUID, doc_infos: list[tuple[uuid.UUID, str, int]]) -> None:
+    """Background coroutine that extracts all documents and updates progress."""
+    from app.services.extraction import extract_document
+    from app.services.post_processing import post_process_document
+    from app.services.gap_analysis import analyze_extraction_gaps
+
+    sid = str(session_id)
+    doc_ids: list[uuid.UUID] = []
+
+    async with async_session_factory() as db:
+        try:
+            for doc_id, filename, _num_pages in doc_infos:
+                did = str(doc_id)
+                try:
+                    def make_progress_cb(d_id: str):
+                        def cb(page_number: int, phase: str):
+                            update_doc_progress(sid, d_id, phase=ExtractionPhase(phase), current_page=page_number)
+                        return cb
+
+                    fields = await extract_document(
+                        doc_id, db, on_progress=make_progress_cb(did),
+                    )
+
+                    update_doc_progress(sid, did, phase=ExtractionPhase.post_processing)
+                    await post_process_document(doc_id, session_id, db)
+
+                    mark_document_done(sid, did, len(fields))
+                    doc_ids.append(doc_id)
+
+                except Exception as exc:
+                    logger.exception("Extraction failed for document %s", doc_id)
+                    mark_document_failed(sid, did, str(exc))
+                    # Continue with next document
+                    continue
+
+            await db.commit()
+
+            # Gap analysis (uses its own queries)
+            gap_report = await analyze_extraction_gaps(session_id, doc_ids, db) if doc_ids else None
+            finish_session(sid, status="completed", gap_report=gap_report)
+
+        except Exception as exc:
+            logger.exception("Background extraction failed for session %s", session_id)
+            finish_session(sid, status="failed")
+
+
 @router.post("/extract-all")
 async def extract_all_documents(
     session_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Trigger extraction for all uploaded documents in a session."""
+    """Start extraction for all uploaded documents. Returns immediately; poll /extraction-status for progress."""
     session = await db.get(Session, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Check if extraction is already running
+    existing = get_progress(str(session_id))
+    if existing and existing["status"] == "running":
+        raise HTTPException(status_code=409, detail="Extraction already in progress")
 
     stmt = (
         select(Document)
@@ -237,29 +301,47 @@ async def extract_all_documents(
     if not docs:
         raise HTTPException(status_code=400, detail="No documents ready for extraction")
 
-    from app.services.extraction import extract_document
-    from app.services.post_processing import post_process_document
+    # Build doc info list and initialize progress
+    doc_infos = [(doc.id, doc.filename, doc.num_pages) for doc in docs]
+    start_progress(str(session_id), [(str(d.id), d.filename, d.num_pages) for d in docs])
 
-    results = []
-    for doc in docs:
-        fields = await extract_document(doc.id, db)
-        entity = await post_process_document(doc.id, session_id, db)
-        results.append({
-            "document_id": str(doc.id),
-            "filename": doc.filename,
-            "fields_extracted": len(fields),
-            "entity": {
-                "id": str(entity.id),
-                "tag": entity.tag,
-                "name": entity.name,
-            } if entity else None,
-        })
+    # Launch background task
+    asyncio.create_task(_run_extraction_background(session_id, doc_infos))
 
     return {
-        "status": "completed",
-        "documents_processed": len(results),
-        "results": results,
+        "status": "started",
+        "documents_queued": len(docs),
+        "message": "Extraction started. Poll /extraction-status for progress.",
     }
+
+
+@router.get("/extraction-status")
+async def get_extraction_status(
+    session_id: uuid.UUID,
+):
+    """Poll extraction progress for a session."""
+    progress = get_progress(str(session_id))
+    if progress is None:
+        return {"status": "idle", "message": "No extraction in progress or recently completed."}
+    return progress
+
+
+@router.get("/extraction-report")
+async def get_extraction_report(
+    session_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a formatted extraction report with gap analysis for all documents."""
+    session = await db.get(Session, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    from app.services.gap_analysis import analyze_extraction_gaps, format_extraction_report
+
+    report = await analyze_extraction_gaps(session_id, None, db)
+    formatted = format_extraction_report(report)
+
+    return {"report": formatted, "raw": report}
 
 
 @router.get("", response_model=list[DocumentResponse])
@@ -298,24 +380,19 @@ async def get_document(
     return doc
 
 
-@router.get("/{document_id}/pages/{page_num}/image")
-async def get_page_image(
+@router.get("/{document_id}/pdf")
+async def get_document_pdf(
     session_id: uuid.UUID,
     document_id: uuid.UUID,
-    page_num: int,
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(DocumentPage).where(
-        DocumentPage.document_id == document_id,
-        DocumentPage.page_number == page_num,
-    )
-    result = await db.execute(stmt)
-    page = result.scalar_one_or_none()
-    if page is None:
-        raise HTTPException(status_code=404, detail="Page not found")
+    """Serve the original PDF file for frontend rendering."""
+    doc = await db.get(Document, document_id)
+    if doc is None or doc.session_id != session_id:
+        raise HTTPException(status_code=404, detail="Document not found")
 
-    full_path = settings.RENDERED_PAGES_DIR / page.image_path
-    if not full_path.exists():
-        raise HTTPException(status_code=404, detail="Page image file not found")
+    pdf_path = Path(doc.file_path)
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="PDF file not found on disk")
 
-    return FileResponse(str(full_path), media_type="image/png")
+    return FileResponse(str(pdf_path), media_type="application/pdf")

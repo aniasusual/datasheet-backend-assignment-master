@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Check, X, Pencil, ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '../api/client';
 import type { ExtractedField, FieldStatus } from '../types';
@@ -112,8 +112,20 @@ export default function FieldPanel({
   sessionId, fields, selectedFieldId, onSelectField, onFieldUpdated,
   filterSection, onFilterSection, filterStatus, onFilterStatus,
 }: Props) {
-  const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(Object.keys(SECTION_LABELS)));
+  const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set());
+  const initializedRef = useRef(false);
   const [editingFieldId, setEditingFieldId] = useState<string | null>(null);
+
+  // Expand all sections when fields first arrive
+  useEffect(() => {
+    if (fields.length > 0 && !initializedRef.current) {
+      setExpandedSections(new Set(fields.map(f => f.section)));
+      initializedRef.current = true;
+    }
+    if (fields.length === 0) {
+      initializedRef.current = false;
+    }
+  }, [fields]);
 
   const toggleSection = (section: string) => {
     setExpandedSections(prev => {
@@ -147,7 +159,14 @@ export default function FieldPanel({
     (grouped[f.section] ??= []).push(f);
   }
 
-  const sections = Object.keys(SECTION_LABELS);
+  // Only show sections that have extracted fields
+  const activeSections = [...new Set(fields.map(f => f.section))];
+  // Preserve a stable order: use SECTION_LABELS order for known sections, then any unknown ones
+  const knownOrder = Object.keys(SECTION_LABELS);
+  const sections = [
+    ...knownOrder.filter(s => activeSections.includes(s)),
+    ...activeSections.filter(s => !knownOrder.includes(s)),
+  ];
 
   return (
     <div className="w-96 bg-[#151821] border-l border-gray-800 flex flex-col h-full">
@@ -167,7 +186,7 @@ export default function FieldPanel({
           >
             <option value="">All sections</option>
             {sections.map(s => (
-              <option key={s} value={s}>{SECTION_LABELS[s]}</option>
+              <option key={s} value={s}>{SECTION_LABELS[s] || s}</option>
             ))}
           </select>
           <select

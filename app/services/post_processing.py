@@ -178,7 +178,7 @@ async def post_process_document(
 
     pages_text = []
     for p in pages:
-        pages_text.append(f"--- Page {p.page_number} ({p.page_type}) ---\n{p.raw_text}")
+        pages_text.append(f"--- Page {p.page_number} ---\n{p.raw_text}")
 
     user_content = (
         f"Document: {document.filename} (tag: {document.pump_tag}, format: {document.format_type})\n\n"

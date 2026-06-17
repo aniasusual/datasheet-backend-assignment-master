@@ -1,360 +1,473 @@
-# Architecture: Data Ingestion & Extraction Pipeline
+# Architecture: Datasheet Extraction System
 
-## Overview
+## What This System Does
 
-This system extracts structured technical fields from industrial pump process datasheets (PDFs). It takes a PDF in and produces a normalized, queryable set of fields with citations, confidence scores, and equipment entity linkage.
-
-The pipeline has three stages:
-1. **Ingestion** — deterministic PDF processing (no LLM)
-2. **Extraction** — per-page vision LLM calls with structured output
-3. **Post-processing** — cross-page dedup, footnote resolution, entity creation
+Takes industrial process datasheets (PDFs) — pumps, compressors, heat exchangers, any equipment type — and extracts every technical field into a structured, queryable database. Includes human-in-the-loop review, a conversational agent, and a feedback loop that improves extraction over time. No hardcoded field lists, no hardcoded document formats.
 
 ---
 
-## Input Documents
+## System Overview
 
-We handle 4 pump process datasheets in 2 distinct formats:
-
-### English Tabular (P718, P818)
-- 3-4 pages each
-- Page 1: revision modification log + hold list (boilerplate — no technical data)
-- Page 2: main data page — spreadsheet-style grid with numbered rows, color-coded cells (green = vendor, blue = client, red = warnings)
-- Page 3-4: general notes, footnoted remarks, off-spec operating conditions table
-- Units: imperial (GPM, psig, °F, hp, ft)
-- Row labels map to specific pump parameters (Product Handled, Pump, Driver)
-
-### French Bilingual Form (P300228, P600173)
-- 2-3 pages each
-- No boilerplate pages — all pages contain data
-- Structured form with French primary labels and English subtitles
-- Units: metric (m³/h, kg/cm², °C, kW)
-- Sections: Operating Conditions, Construction & Materials, Motor, Remarks
-- Some pages are image-only (P600173) — pdfplumber extracts 0 chars
-
-### Key Challenges
-- **Spatial layout encodes meaning**: a value's meaning comes from its row label + column header, not just the text
-- **Color coding carries semantic info**: not accessible via text extraction
-- **Footnote cross-references**: values like "(3)" or "(7)" reference notes on later pages
-- **Bilingual fields**: same field has French and English names
-- **Image-only pages**: some PDFs have text embedded as images, not as selectable text
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         FRONTEND (React)                             │
+│                                                                      │
+│   ┌──────────┐  ┌──────────────────┐  ┌────────────────────────┐    │
+│   │ Document  │  │   PDF Viewer     │  │   Field Review Panel   │    │
+│   │ Sidebar   │  │ (native browser) │  │   (verify/edit/reject) │    │
+│   │           │  ├──────────────────┤  └────────────────────────┘    │
+│   │ Upload    │  │   Agent Chat     │                                │
+│   │ Extract   │  │ (query + HITL)   │                                │
+│   └──────────┘  └──────────────────┘                                │
+├──────────────────────────────────────────────────────────────────────┤
+│                        BACKEND (FastAPI)                             │
+│                                                                      │
+│   ┌───────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐  │
+│   │ Ingestion │  │  Extraction  │  │   Agent    │  │    Gap     │  │
+│   │ Service   │  │  (3-pass)    │  │  Service   │  │  Analysis  │  │
+│   └───────────┘  └──────────────┘  └────────────┘  └────────────┘  │
+├──────────────────────────────────────────────────────────────────────┤
+│                      DATABASE (PostgreSQL)                            │
+│                                                                      │
+│   Sessions → Documents → DocumentPages                               │
+│                  ↓                                                    │
+│           ExtractedFields → FieldCorrections                         │
+│                  ↓                                                    │
+│          EquipmentEntities                                           │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Stage 1: Ingestion
 
-**File**: `app/services/document_processor.py`
-**Input**: PDF file upload
-**Output**: `Document` + `DocumentPage` records in PostgreSQL
-**LLM calls**: Zero — purely deterministic
+**File:** `app/services/document_processor.py`
+**Trigger:** `POST /sessions/{id}/documents/upload`
+**LLM calls:** Zero
 
-### Process
+When a user uploads a PDF:
 
-```
-PDF Upload
-  → Validate (magic bytes via `filetype` lib — don't trust extensions alone)
-  → Save to ./uploads/{session_id}/
-  → Create Document record (status: uploading)
-  → For each page:
-      → Render to PNG at 300 DPI (pdf2image / poppler)
-      → Extract raw text (pdfplumber)
-      → Extract layout-aware text (pdfplumber, preserves spatial positioning)
-      → Extract tables as JSON (pdfplumber)
-      → Classify page: content vs boilerplate
-      → Determine extraction quality: full_text / partial_text / image_only
-      → Save PNG to ./rendered_pages/{document_id}/page_N.png
-      → Create DocumentPage record
-  → Detect pump tag from filename/content (regex)
-  → Detect format type: french_form vs english_tabular (keyword counting)
-  → Update Document status to 'uploaded'
-```
+1. **Validate** — check magic bytes via `filetype` library (don't trust extensions alone)
+2. **Save** — write PDF to `./uploads/{session_id}/filename.pdf`
+3. **Create Document record** — status: `uploading`
+4. **Process each page** with `pdfplumber`:
+   - Extract raw text (plain text dump)
+   - Extract layout text (preserves spatial positioning of text on the page)
+   - Extract tables as JSON (rows × columns)
+   - Measure page dimensions (width × height in PDF points)
+   - Rate text quality: `full_text` / `partial_text` / `image_only`
+5. **Update Document** — status: `uploaded`, set `num_pages`
 
-### Design Decisions
+### What ingestion does NOT do
 
-**Why pdf2image instead of pdfplumber's built-in renderer?**
-pdfplumber renders via `wand`/ImageMagick which can be inconsistent. `pdf2image` wraps `poppler` (pdftoppm) which is the gold standard for PDF rendering — sharper output, more reliable, better font handling.
+- **No rendering to images.** The PDF file sits on disk untouched. The frontend renders it natively via the browser's built-in PDF viewer. The LLM receives raw PDF pages via PyMuPDF.
+- **No OCR.** The vision LLM reads the PDF directly.
+- **No classification.** No hardcoded keywords, no regex tag detection, no language detection. All classification is deferred to the extraction pipeline where the LLM can see the actual content.
+- **No hardcoding of any kind.** The processor is format-agnostic — it works identically for pump datasheets, compressor specs, heat exchanger data, or any other PDF.
 
-**Why 300 DPI?**
-These datasheets have small text in dense grid cells. 200 DPI (the previous setting) loses detail in small fonts. 300 DPI gives 2550×3300px per page — large enough for the LLM vision model to read every value clearly. Higher DPI (400+) would increase file sizes and LLM token costs without meaningful quality gain.
+### Data Stored
 
-**Why keep both text and images?**
-Text extraction is fast and cheap but lossy — it doesn't capture spatial layout, color coding, or text-in-images. The rendered PNG captures everything but costs more LLM tokens. We provide both: the image is the primary extraction input, the text is supplementary context that helps the LLM when image quality is ambiguous.
+**Document:**
+- `id`, `session_id`, `filename`, `file_path` (to PDF on disk)
+- `pump_tag` (set later by extraction, initially null)
+- `format_type` (set later by extraction, initially null)
+- `status` (uploading → uploaded → extracting → extracted → failed)
+- `num_pages`
 
-**Why classify pages as content vs boilerplate?**
-Pages like revision logs and hold lists contain no technical data. Skipping them saves one LLM call per boilerplate page (~30s and ~5K tokens). Classification is simple: if a page contains "REVISION MODIFICATION LOG" or "HOLD LIST" and little other text, it's boilerplate.
-
-**Why extract pump tag during ingestion?**
-The tag (e.g., "P-718") is used to provide context to the LLM during extraction. Having it early means the extraction prompt can say "this is pump P-718" rather than making the LLM figure it out. Tags are extracted from filenames via regex (`pds-P718.pdf` → `P-718`), with a fallback to content scanning.
-
-**Why detect format type?**
-Knowing whether a document is `french_form` or `english_tabular` helps the LLM apply the right extraction strategy. French forms need bilingual field mapping; English tabular forms have different layout conventions. We detect this by counting French keywords (PRESSION, DÉBIT, ASPIRATION, etc.) — ≥3 hits = French form.
-
-**Why PDF-only (dropped DOCX/XLSX/image support)?**
-The assignment specifies PDF datasheets. Supporting DOCX/XLSX added LibreOffice as a system dependency (fragile in containers) and complex fallback rendering code. Removing it eliminated ~200 lines of code and one system dependency.
-
-**Why no OCR?**
-The previous design used Tesseract OCR as a fallback when text extraction failed. We dropped it because the vision LLM reads images directly — it is a better OCR than Tesseract for structured forms. This eliminated the pytesseract dependency and its Tesseract system requirement.
-
-### Data Model
-
-**Document** (`app/models/document.py`)
-```
-id: UUID (PK)
-session_id: UUID (FK → sessions)
-filename: str — original filename
-file_path: str — path on disk
-pump_tag: str | null — e.g. "P-718", extracted from filename/content
-format_type: str | null — "french_form" or "english_tabular"
-status: enum — uploading → uploaded → extracting → extracted → failed
-num_pages: int
-```
-
-**DocumentPage** (`app/models/document_page.py`)
-```
-id: UUID (PK)
-document_id: UUID (FK → documents)
-page_number: int (1-indexed)
-raw_text: text — pdfplumber extracted text
-layout_text: text | null — spatial-aware text extraction
-tables_json: JSONB | null — parsed tables
-image_path: str — relative path to rendered PNG
-width: float — page width in points
-height: float — page height in points
-extraction_quality: enum — full_text | partial_text | image_only
-page_type: str — "content" or "boilerplate"
-```
+**DocumentPage** (one per page):
+- `page_number`, `raw_text`, `layout_text`, `tables_json`
+- `width`, `height` (in PDF points)
+- `extraction_quality` (full_text / partial_text / image_only)
 
 ---
 
-## Stage 2: Extraction
+## Stage 2: Extraction (Three-Pass Pipeline)
 
-**File**: `app/services/extraction.py`
-**Input**: DocumentPage records with images + text
-**Output**: `ExtractedField` records
-**LLM calls**: One per content page
+**File:** `app/services/extraction.py`
+**Trigger:** `POST /sessions/{id}/documents/{id}/extract` or `POST /sessions/{id}/documents/extract-all`
+**LLM calls:** ~3 per page
 
-### Process
+Three LLM calls per page. Every page gets processed — there's no hardcoded "boilerplate" skipping. Pages with no fields simply produce zero extracted values naturally.
+
+### Pass 1: Field Discovery + Document Metadata
+
+**Question to LLM:** *"Here's the PDF page. What field labels exist? What's the equipment tag, type, and language?"*
 
 ```
-For each content page (skip boilerplate):
-  → Load page image from disk
-  → Resize to max 2048px on long side (LANCZOS downscale)
-  → Base64-encode the resized image
-  → Build prompt: system prompt + [image, text context, instruction]
-  → Call LLM with tool_choice forcing "save_extracted_fields"
-  → Parse tool call response
-  → Create ExtractedField records in DB
-  → Retry up to 3 times if response is empty or has no tool call
+Input:  Original PDF page (via PyMuPDF — native PDF, not a rendered image)
+      + raw text from pdfplumber as supplementary context
+
+Output: {
+  equipment_tag: "P-718(A/B)",       // detected from page content
+  equipment_type: "pump",             // could be compressor, heat_exchanger, etc.
+  service_name: "DIESEL PRODUCT PUMPS",
+  language: "english",                // or french, bilingual, other
+  fields: [
+    {label: "Normal Flowrate", has_value: true,  section: "operating_conditions"},
+    {label: "Minimum Flowrate", has_value: true,  section: "operating_conditions"},
+    {label: "Speed Range",      has_value: false, section: "pump_performance"},
+    ...
+  ]
+}
 ```
 
-### LLM Call Design
+This identifies the **document's own schema** — every field that exists on the page, including empty ones. No hardcoded field list, no hardcoded language detection, no regex tag patterns. The LLM reads the actual document content.
 
-**Model**: Configurable via `LLM_MODEL` env var (currently `gemini/gemini-2.5-flash` via litellm)
+The `equipment_tag`, `equipment_type`, and `language` from the first page that has them are used to populate the Document record's `pump_tag` and `format_type` fields — replacing the old hardcoded regex + French keyword approach.
 
-**Input to LLM**:
-1. System prompt — field taxonomy, extraction rules, bilingual mappings, confidence guidelines
-2. Page image — base64 PNG, resized to max 2048px
-3. Raw text — supplementary context from pdfplumber
-4. Layout text — spatial-aware text when available
-5. Parsed tables — JSON from pdfplumber table extraction
-6. Instruction — "Extract all fields from page N of document X (pump tag: Y)"
+Fields with `has_value: false` are tracked — these are labels where the value cell is empty (e.g., vendor hasn't filled their part). This is different from "the LLM missed it."
 
-**Output from LLM**: A single tool call `save_extracted_fields` with an array of field objects.
+### Pass 2: Guided Extraction
 
-**Why tool use instead of JSON mode?**
-Tool use (function calling) gives us a validated schema — the LLM must return fields matching our exact type definitions. JSON mode can produce arbitrary structures. Tool use also works consistently across providers (OpenAI, Anthropic, Google) via litellm.
+**Question to LLM:** *"Here's the PDF page. Extract values for these specific fields: [list from Pass 1]."*
 
-**Why force tool_choice?**
-Without forced tool choice, the model sometimes returns a text explanation instead of calling the tool. Forcing `tool_choice={"type": "function", "function": {"name": "save_extracted_fields"}}` ensures we always get structured output. However, Gemini Flash sometimes returns empty responses even with forced tool choice — hence the retry logic.
-
-### Image Resizing
-
-**Why resize at all?**
-The 300 DPI PNGs are 2550×3300 pixels (~8.4M pixels). This is a large payload that:
-- Consumes more LLM input tokens (each image costs tokens proportional to its size)
-- Increases latency
-- Can trigger model instability (Gemini Flash intermittently returns empty responses on very large images)
-
-**Why 2048px max?**
-We tested three sizes:
-- **No resize (2550×3300)**: Best accuracy when it works, but Gemini returns empty responses ~30% of the time
-- **1600px**: Too aggressive — French forms with small text lost quality, page 1 of P300228 failed
-- **2048px**: Sweet spot — all text remains readable, payload reduced ~40%, Gemini reliability improved
-
-The original 300 DPI images are kept on disk for the HITL interface. Only the LLM sees the resized version.
-
-### Retry Logic
-
-Gemini Flash intermittently returns empty `choices` arrays or responses without tool calls. This is a known model behavior, not a code bug — the same page succeeds on retry.
-
-Our strategy:
-- Up to 3 attempts per page
-- 2 second delay between retries
-- Log each failed attempt
-- If all 3 fail, return empty fields for that page (the page can be re-extracted later)
-
-In testing, this recovers ~80% of initially-failed pages.
-
-### System Prompt
-
-The system prompt (`EXTRACTION_SYSTEM_PROMPT` in `extraction.py`) defines:
-
-**Field taxonomy** — 9 sections:
-1. `general_info` — pump tag, service, type, driver, project metadata
-2. `product_handled` — fluid, temperature, viscosity, density, vapor pressure
-3. `operating_conditions` — flowrates, pressures
-4. `pump_performance` — head, NPSH, power, efficiency
-5. `construction_materials` — impeller, casing, shaft materials
-6. `mechanical_design` — seals, bearings, couplings, nozzles
-7. `motor_data` — voltage, protection, frame
-8. `weights_dimensions` — weight, base dimensions
-9. `notes_remarks` — footnotes, warnings, off-spec conditions
-
-**Extraction rules**:
-- Preserve exact values (no rounding, no unit conversion)
-- Separate units from values ("928 GPM" → raw_value: "928", unit: "GPM")
-- Use English display names for bilingual fields
-- Include footnote references in `note_refs`
-- Extract multiple values as separate fields (normal vs design flowrate)
-- Skip empty/blank fields
-- Include citation text showing where the value was found
-
-**Confidence scoring**:
-- 0.9-1.0: Clearly readable, unambiguous
-- 0.7-0.89: Partially obscured or slightly ambiguous
-- 0.5-0.69: Difficult to read, contextual guess
-- Below 0.5: Very uncertain
-
-**Bilingual mapping**: 20+ French→English field name translations (DÉBIT→Flowrate, PRESSION→Pressure, etc.)
-
-### Data Model
-
-**ExtractedField** (`app/models/extracted_field.py`)
 ```
-id: UUID (PK)
-document_id: UUID (FK → documents)
-entity_id: UUID | null (FK → equipment_entities, set during post-processing)
-field_name: str — normalized snake_case, e.g. "normal_flowrate"
-display_name: str — human-readable, e.g. "Normal Flowrate"
-raw_value: str — exactly as in document
-unit: str | null — separated from value, e.g. "GPM"
-data_type: enum — numeric | text | boolean
-section: str — one of the 9 categories
-confidence: float — 0.0 to 1.0
-status: enum — extracted | verified | corrected | rejected
-citation_page: int — which page the value was found on
-citation_text: str — text snippet showing field + value
-citation_bbox: JSONB | null — bounding box coordinates (not yet populated)
+Input:  PDF page
+      + field list from Pass 1
+      + raw text context
+      + past corrections (if re-extracting)
+
+Output: [
+  {field_name: "normal_flowrate", display_name: "Normal Flowrate",
+   raw_value: "928", unit: "GPM", confidence: 0.95,
+   section: "operating_conditions", data_type: "numeric",
+   citation_text: "Normal flowrate (11) GPM 928", note_refs: ["11"]},
+  ...
+]
 ```
+
+This is **much more accurate** than the old single-pass approach because:
+- The LLM knows exactly what to look for
+- It doesn't have to simultaneously figure out layout AND extract values
+- It can focus on precision — reading the right cell for the right label
+
+### Pass 3: Verification
+
+**Question to LLM:** *"Here are the extracted fields and the raw text. Does anything look wrong?"*
+
+```
+Input:  Extracted fields JSON + raw text + layout text
+        (TEXT ONLY — no PDF page, so this call is cheap)
+
+Output: {
+  issues: [
+    {field_name: "serial_no", issue_type: "misread",
+     current_value: "0028", correct_value: "0025",
+     explanation: "Text clearly shows 0025"},
+    {field_name: "phantom_field", issue_type: "hallucinated",
+     explanation: "This value doesn't appear in the text"},
+  ],
+  verified_count: 43
+}
+```
+
+What happens with issues:
+- **hallucinated** → field is dropped entirely
+- **wrong_value / misread** → value corrected, confidence lowered
+- **wrong_unit** → unit corrected
+- **wrong_section** → confidence lowered, kept
+
+### Why send PDF pages instead of rendered images?
+
+The LLM (Gemini, Claude) accepts PDF input natively. Sending the original PDF page gives:
+- **Full fidelity** — vector graphics, real fonts, no rendering artifacts
+- **4x smaller payload** — ~120KB PDF vs ~420KB PNG per page
+- **No dependencies** — no pdf2image, no poppler, no Pillow
+
+PyMuPDF extracts individual pages as PDF bytes.
+
+### Per-field data stored
+
+**ExtractedField:**
+- `field_name` (snake_case, e.g., "normal_flowrate")
+- `display_name` (human-readable, e.g., "Normal Flowrate")
+- `raw_value` (exactly as in document, e.g., "928")
+- `unit` (separated from value, e.g., "GPM")
+- `data_type` (numeric / text / boolean)
+- `section` (one of 9 categories — see below)
+- `confidence` (0.0-1.0, adjusted by verification pass)
+- `status` (extracted / verified / corrected / rejected)
+- `citation_page` (which page)
+- `citation_text` (exact text snippet showing field + value)
+
+### Field Sections
+
+| Section | Examples |
+|---------|----------|
+| `general_info` | Equipment tag, service, type, driver, project metadata |
+| `product_handled` | Fluid, temperature, viscosity, density, vapor pressure |
+| `operating_conditions` | Flowrates, pressures (suction, discharge, differential) |
+| `pump_performance` | Head, NPSH, shaft power, efficiency, speed |
+| `construction_materials` | Impeller, casing, shaft materials |
+| `mechanical_design` | Seals, bearings, couplings, nozzles |
+| `motor_data` | Voltage, protection, frame, speed |
+| `weights_dimensions` | Weight, base dimensions |
+| `notes_remarks` | Footnotes, warnings, special conditions |
+
+These sections are prompting guidelines — the LLM categorizes fields into whichever section fits. They're not enforced as a strict schema.
 
 ---
 
 ## Stage 3: Post-Processing
 
-**File**: `app/services/post_processing.py`
-**Input**: All ExtractedField records for a document + page text
-**Output**: EquipmentEntity + deduplicated/updated fields
-**LLM calls**: One per document
+**File:** `app/services/post_processing.py`
+**LLM calls:** 1 per document (after all pages extracted)
 
-### Process
+One LLM call per document handles cross-page concerns:
+
+1. **Footnote resolution** — matches "(3)", "(7)" references to actual note text from notes pages
+2. **Deduplication** — removes duplicate fields from repeated page headers
+3. **Entity creation** — extracts pump tag, type, service name → creates `EquipmentEntity` record
+4. **Field linking** — links all fields to the entity
+5. **Cross-page validation** — flags contradictions between pages
+
+### Equipment Entity
+
+**EquipmentEntity:**
+- `tag` (e.g., "P-718(A/B)")
+- `entity_type` (e.g., "pump")
+- `name` (e.g., "DIESEL PRODUCT PUMPS")
+- `metadata_json` (project, area, unit, revision, footnotes)
+- Linked to documents (many-to-many) and fields
+
+---
+
+## Stage 4: Gap Analysis
+
+**File:** `app/services/gap_analysis.py`
+**Trigger:** Automatically after extraction, or via agent tool
+
+### Cross-Document Comparison (no hardcoding)
+
+Instead of a hardcoded list of expected fields, the system compares what fields exist across all documents in the session:
+
+- If 3 out of 4 documents have `suction_pressure` but one doesn't → that's a gap
+- A field is "common" if it appears in >50% of documents
+- Works for any document type — pumps, compressors, heat exchangers, whatever
+
+### Gap Report Contains
+
+1. **Failed pages** — pages with 0 extracted fields (LLM returned empty)
+2. **Missing fields** — common fields present in other documents but absent from this one
+3. **Low-confidence fields** — fields with confidence <70% that need human review
+
+The report is formatted as readable markdown and injected into the agent chat automatically after extraction.
+
+---
+
+## HITL Feedback Loop
+
+**Files:** `app/api/fields.py` (PATCH endpoint), `app/services/extraction.py` (_build_corrections_context)
+
+### How corrections work
+
+1. User reviews a field in the UI (or via agent)
+2. User edits value/unit → `PATCH /fields/{id}`
+3. System creates a `FieldCorrection` audit record:
+   ```
+   original_value: "2.7"
+   corrected_value: "2.7"
+   unit change: null → "kW"
+   reason: "unit was missing from extraction"
+   corrected_by: "user" (or "agent")
+   ```
+4. Field status changes to `corrected`
+
+### How corrections improve re-extraction
+
+When a user clicks "Re-extract":
+
+1. System gathers all corrections + rejected fields for the document
+2. Formats them as prompt context:
+   ```
+   Past Corrections — apply these lessons:
+   - Field 'bhp_rated': extracted '2.7' → correct: '2.7' (unit: kW). unit was missing
+   - Field 'corrosion_erosion': '(5)' — REJECTED, do not extract again
+   ```
+3. Deletes old extracted fields
+4. Re-runs the three-pass extraction with corrections appended to the system prompt
+5. The LLM learns from past mistakes — few-shot learning from corrections
+
+No fine-tuning. No conversation memory. Just corrections from the DB injected into a fresh prompt each time.
+
+---
+
+## Conversational Agent
+
+**File:** `app/services/agent.py`
+**Trigger:** `POST /sessions/{id}/agent`
+
+A tool-use agent that can query, edit, verify, and reject fields through natural language.
+
+### Architecture
 
 ```
-After all pages of a document are extracted:
-  → Load all ExtractedField records
-  → Load all page text (for footnote context)
-  → Send to LLM as JSON summary + raw text
-  → LLM calls post_process_results tool with:
-      → entity: {tag, type, name, metadata}
-      → footnote_resolutions: [{note_number, note_text}]
-      → duplicate_field_ids: [field IDs to remove]
-      → field_updates: [{field_id, updated_value, reason}]
-  → Create EquipmentEntity record
-  → Link entity to document (M2M via entity_documents table)
-  → Link all fields to entity (set entity_id)
-  → Delete duplicate fields
-  → Apply field value updates
-  → Store resolved footnotes in entity metadata
+Frontend sends: {messages: [...history], message: "new message"}
+    │
+    ▼
+Build prompt: system + conversation history + new message
+    │
+    ▼
+LLM responds → text response OR tool calls
+    │
+    ├── Text → return to user
+    └── Tool calls → execute → feed results back to LLM → loop
+        (max 5 rounds)
 ```
 
-### Design Decisions
+### 8 Tools
 
-**Why a separate post-processing step?**
-Per-page extraction can't resolve cross-page relationships:
-- Footnotes: "(3)" on page 2 references note text on page 4
-- Duplicates: page headers repeat pump tag/service on every page
-- Entity: pump tag, type, and service name appear across multiple pages
+| Tool | Purpose |
+|------|---------|
+| `get_session_overview` | Lists all documents, pages, statuses, field counts |
+| `get_page_text` | Returns raw/layout text + tables for a specific page |
+| `search_fields` | Search fields by pump tag, name, section, status, confidence |
+| `get_field` | Single field detail with correction history |
+| `update_field` | Edit value/unit, creates audit trail |
+| `verify_fields` | Bulk verify fields |
+| `reject_fields` | Bulk reject fields |
+| `get_extraction_gaps` | Cross-document gap analysis |
 
-**Why one LLM call for all of this?**
-These tasks are interdependent — dedup needs to see all fields, footnote resolution needs all text, entity creation needs the full picture. One call with full context is more reliable than multiple narrow calls.
+### Context Management
 
-**Why store footnotes in entity metadata?**
-Footnotes are document-level context, not field-level. Storing them in the entity's `metadata_json` keeps them accessible without adding a separate table. A dedicated footnotes table would be premature for 4 documents.
+**Frontend owns the conversation history.** The message array lives in React state and is sent with each request. The server is stateless — no DB message storage, no context compaction. If the conversation gets too long, the frontend can truncate old messages.
+
+### Example Interactions
+
+```
+User: "What's the impeller material for P-300228?"
+Agent: [search_fields(pump_tag="P-300228", field_name="impeller")]
+       → "CS (Carbon Steel), confidence 0.9, from page 1."
+
+User: "That's wrong, it should be SS316"
+Agent: [update_field(field_id="...", raw_value="SS316", reason="user correction")]
+       → "Corrected: Impeller Material updated from CS to SS316."
+
+User: "Verify all product_handled fields above 0.9 confidence"
+Agent: [search_fields(section="product_handled", min_confidence=0.9)]
+       [verify_fields(field_ids=["...", "..."])]
+       → "Verified 5 fields: Liquid, Density, Viscosity, Vapor Pressure, Specific Gravity."
+
+User: "How complete is the extraction?"
+Agent: [get_extraction_gaps()]
+       → "P718 page 3 failed extraction. P600173 is missing 3 fields found in other docs..."
+```
+
+---
+
+## Frontend
+
+**Stack:** React 19, TypeScript, Tailwind CSS, Vite
+**Theme:** Dark mode (`#0f1117` background)
+
+### Layout: Three Panels
+
+```
+┌──────────┬───────────────────────┬────────────────────┐
+│ Document │                       │  Extracted Fields   │
+│ Sidebar  │     Center Panel      │  (Review Mode)      │
+│          │                       │                     │
+│ [docs]   │  Review: PDF Viewer   │  [general_info ▼]   │
+│ [upload] │  Agent:  Chat UI      │    Service: PUMP... │
+│ [extract]│                       │    Tag: P-718       │
+│          │  ← mode toggle →      │  [product ▼]        │
+│          │  [Review] [Agent]     │    Liquid: Hydro... │
+└──────────┴───────────────────────┴────────────────────┘
+```
+
+### Components
+
+**DocumentSidebar** (`components/DocumentSidebar.tsx`)
+- Document list with status badges (color-coded)
+- Upload PDF button
+- "Extract All" button (triggers extraction + auto-sends report to agent)
+
+**PageViewer** (`components/PageViewer.tsx`)
+- Renders PDF natively via `<iframe>` with `#page=N` fragment
+- Page navigation (prev/next)
+- Zoom controls (50-200%)
+- Citation text display when a field is selected
+
+**FieldPanel** (`components/FieldPanel.tsx`)
+- Fields grouped by section (collapsible)
+- Per-field: name, value, unit, confidence badge, status badge
+- Action buttons: Verify, Edit, Reject
+- Inline editor: value, unit, reason → saves correction
+- Filters: section, status
+- Clicking a field jumps the PDF viewer to the citation page
+
+**AgentChat** (`components/AgentChat.tsx`)
+- Chat interface with user/assistant message bubbles
+- Tool action badges (shows what the agent did: "Searched fields", "Verified 5 fields")
+- Example queries as quick-start buttons
+- Injection mode: extraction report appears automatically after extraction
+- Auto-refreshes field panel when agent modifies fields
+
+### Pages
+
+**SessionsPage** — landing page, lists sessions, create/delete
+**SessionDetailPage** — three-panel layout, mode toggle (Review/Agent), state management for selected doc/page/field
 
 ---
 
 ## API Endpoints
 
-**File**: `app/api/documents.py`, `app/api/sessions.py`, `app/api/fields.py`, `app/api/entities.py`
-
+### Sessions
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/v1/sessions` | Create a new session |
-| GET | `/api/v1/sessions` | List all sessions |
-| GET | `/api/v1/sessions/{id}` | Session detail with counts |
-| DELETE | `/api/v1/sessions/{id}` | Delete session + cascade |
-| POST | `/api/v1/sessions/{id}/documents/upload` | Upload PDFs (triggers ingestion) |
-| POST | `/api/v1/sessions/{id}/documents/{id}/extract` | Extract one document |
-| POST | `/api/v1/sessions/{id}/documents/extract-all` | Extract all uploaded documents |
-| GET | `/api/v1/sessions/{id}/documents` | List documents |
-| GET | `/api/v1/sessions/{id}/documents/{id}` | Document detail + pages |
-| GET | `/api/v1/sessions/{id}/documents/{id}/pages/{n}/image` | Serve page PNG |
-| GET | `/api/v1/sessions/{id}/fields` | List fields with filters |
-| GET | `/api/v1/sessions/{id}/fields/stats` | Extraction statistics |
-| GET | `/api/v1/sessions/{id}/fields/{id}` | Field detail + corrections |
-| GET | `/api/v1/sessions/{id}/entities` | List equipment entities |
-| GET | `/api/v1/sessions/{id}/entities/{id}` | Entity detail + fields |
+| POST | `/api/v1/sessions` | Create session |
+| GET | `/api/v1/sessions` | List sessions |
+| GET | `/api/v1/sessions/{id}` | Session detail |
+| DELETE | `/api/v1/sessions/{id}` | Delete session (cascade) |
 
-### Field Filtering
+### Documents
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `.../documents/upload` | Upload PDFs (triggers ingestion) |
+| POST | `.../documents/{id}/extract` | Extract one document |
+| POST | `.../documents/extract-all` | Extract all uploaded docs |
+| POST | `.../documents/{id}/re-extract` | Re-extract with corrections |
+| GET | `.../documents/extraction-report` | Formatted gap analysis |
+| GET | `.../documents` | List documents |
+| GET | `.../documents/{id}` | Document detail + pages |
+| GET | `.../documents/{id}/pdf` | Serve original PDF |
 
-`GET /fields` supports:
-- `document_id` — filter by document
-- `section` — filter by category (e.g., `operating_conditions`)
-- `status` — filter by status (extracted, verified, corrected, rejected)
-- `min_confidence` — minimum confidence threshold
-- `field_name` — substring search on field name
-- `limit` / `offset` — pagination
+### Fields
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `.../fields` | List fields (filters: doc, section, status, confidence, page) |
+| GET | `.../fields/stats` | Extraction statistics |
+| GET | `.../fields/{id}` | Field detail + corrections |
+| PATCH | `.../fields/{id}` | Update field (creates correction) |
+| POST | `.../fields/bulk-verify` | Verify multiple fields |
+
+### Entities
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `.../entities` | List equipment entities |
+| GET | `.../entities/{id}` | Entity detail + linked fields |
+
+### Query & Agent
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `.../query` | Stateless single-shot query |
+| POST | `.../agent` | Conversational agent with tools |
 
 ---
 
-## What Was Removed (and Why)
+## Database Schema
 
-### Agent System (deleted: `app/agent/`, `app/tools/`, `app/prompts/`)
-The previous design used a 3-tier agent hierarchy (orchestrator → extraction sub-agent → validation sub-agent) with an iterative loop of up to 30 LLM calls per request. This was overengineered for structured extraction:
-- Non-deterministic cost (could use 5 or 50 LLM calls for the same document)
-- Complex context management (compaction, budget guards, token tracking)
-- Debugging difficulty (which of 30 iterations went wrong?)
+```
+sessions
+  ├── documents
+  │     ├── document_pages
+  │     └── extracted_fields
+  │           └── field_corrections
+  ├── equipment_entities
+  │     └── entity_documents (M2M → documents)
+```
 
-Our replacement: 1 LLM call per page + 1 post-processing call. Predictable, debuggable, cheaper.
-
-### Redis/Arq Job Queue (deleted: `app/worker.py`)
-The previous design enqueued extraction as async jobs via Redis/Arq. This added Redis as an infrastructure dependency and required a separate worker process. For 4 documents at ~60s each, synchronous extraction in the API request is simpler and sufficient.
-
-### Chat/Conversation System (deleted: `app/api/chat.py`, `app/models/message.py`)
-The previous design had a conversational chat interface where users typed "extract all fields" and an agent responded. This is unnecessary — extraction is triggered by a POST endpoint, not a conversation.
-
-### Cost Tracking (deleted: `app/models/cost_record.py`, `app/api/costs.py`)
-With predictable LLM calls (1 per page), cost is easy to calculate from token counts in the logs. A separate cost tracking database table with per-call records was overhead.
-
-### OCR/Tesseract (removed from pipeline)
-The vision LLM reads images directly — it is a better OCR than Tesseract for structured forms with complex layouts.
-
-### DOCX/XLSX Support (removed)
-Not needed for this assignment (PDF only). Eliminated LibreOffice system dependency.
-
-### Correction Patterns (deleted: `app/models/correction_pattern.py`)
-Global learning across sessions from recurring corrections. Premature optimization for 4 documents.
-
-### Entity Relationships (deleted: `app/models/entity_relationship.py`)
-Modeling relationships between entities (pump-to-motor sibling links). Not needed when each document maps to one pump entity.
+All primary keys are UUIDs. Timestamps use `server_default=func.now()`.
 
 ---
 
@@ -362,49 +475,67 @@ Modeling relationships between entities (pump-to-motor sibling links). Not neede
 
 | Component | Technology | Why |
 |-----------|-----------|-----|
-| API | FastAPI | Async, fast, auto-docs |
-| Database | PostgreSQL + AsyncPG | Async, JSONB support, production-ready |
+| API | FastAPI (async) | Fast, auto-docs, async-native |
+| Database | PostgreSQL + AsyncPG | JSONB support, async, production-ready |
 | ORM | SQLAlchemy 2.0 (async) | Type-safe, mature |
 | Migrations | Alembic | Standard for SQLAlchemy |
-| PDF text extraction | pdfplumber | Best Python PDF table/text extractor |
-| PDF rendering | pdf2image (poppler) | Gold standard for PDF→PNG |
-| Image processing | Pillow | Resize before LLM, standard |
-| LLM | litellm | Provider-agnostic (Gemini, OpenAI, Anthropic) |
+| PDF text | pdfplumber | Best Python PDF table/text extractor |
+| PDF pages | PyMuPDF (fitz) | Extract individual pages as PDF bytes |
+| LLM | litellm | Provider-agnostic (Gemini, OpenAI, Claude) |
 | File validation | filetype | Magic byte detection |
+| Frontend | React 19 + TypeScript | Type-safe, modern |
+| Styling | Tailwind CSS v4 | Utility-first, dark theme |
+| Build | Vite | Fast dev server + build |
+| Icons | lucide-react | Clean, consistent icons |
 
 ---
 
-## Test Results
+## Dependencies Eliminated (vs original codebase)
 
-Tested on all 4 datasheets with Gemini 2.5 Flash, 2048px image resize, 3 retries:
+| Removed | Replaced by |
+|---------|-------------|
+| Redis + Arq (job queue) | Synchronous extraction |
+| pdf2image + poppler | PyMuPDF for LLM, browser for frontend |
+| Pillow | Not needed — no image processing |
+| LiteLLM agent framework | Simple tool-use loop |
+| python-docx, openpyxl | PDF-only input |
+| pytesseract + Tesseract | Vision LLM reads PDFs directly |
 
-| Document | Format | Pages | Content Pages | Fields | Time |
-|----------|--------|-------|---------------|--------|------|
-| pds-P300228 | French form | 2 | 2 | 84 | ~65s |
-| pds-P600173 | French form (image-only) | 2 | 2 | 65 | ~55s |
-| pds-P718 | English tabular | 3 | 2 | 47-95* | ~65s |
-| pds-P818 | English tabular | 3 | 2 | 79-98* | ~70s |
+---
 
-*Range reflects Gemini Flash's intermittent tool-call failures. When all pages succeed, field counts are 80-98. When a page fails after 3 retries, those fields are lost. This is a model reliability issue, not a pipeline issue — switching to Claude Sonnet or GPT-4o would eliminate it.
+## Design Principles
 
-### LLM Cost Per Document
-- ~7K input tokens per page (image + text + prompt)
-- ~5K output tokens per page (tool call with fields)
-- **Total per document: ~25-35K tokens (~$0.01-0.02 with Gemini Flash)**
-- **Total for all 4 documents: ~$0.05-0.08**
+1. **No hardcoding.** No hardcoded field lists, language keywords, tag patterns, or page classifications. The LLM sees the document and figures it out. The system works for any equipment type, any language, any company format.
+
+2. **The document is the schema.** Pass 1 discovers what fields exist on each page. The document defines its own structure — we don't impose one.
+
+3. **Separate identification from extraction.** Pass 1 finds what's there. Pass 2 reads the values. Pass 3 verifies. Each pass is focused on one job, which is more accurate than asking the LLM to do everything at once.
+
+4. **Send the real document, not a degraded copy.** The LLM receives native PDF pages, not rendered PNG images. The browser renders PDFs natively, not pre-rendered thumbnails. No unnecessary transformations.
+
+5. **HITL corrections feed forward.** Corrections aren't just stored — they're injected into re-extraction prompts so the LLM learns from mistakes without fine-tuning.
+
+6. **Cross-document gap analysis over hardcoded checklists.** If most documents have a field but one doesn't, that's a gap. No maintained field registry needed.
+
+---
+
+## Cost Per Document
+
+With Gemini 2.5 Flash:
+- **Pass 1** (discovery + metadata): ~5K input + ~3K output tokens per page
+- **Pass 2** (guided extraction): ~5K input + ~5K output tokens per page
+- **Pass 3** (text verification): ~3K input + ~1K output tokens per page (no PDF, cheap)
+- **Post-processing**: ~10K input + ~3K output tokens per document
+- **Total per page**: ~13K input + ~9K output ≈ $0.01-0.03
+- **Total per document (3 pages)**: ~$0.05-0.15
 
 ---
 
 ## Known Limitations
 
-1. **Gemini Flash reliability**: Returns empty responses ~20-30% of the time on complex pages with tool use. Retry logic mitigates but doesn't eliminate this. A more reliable model (Claude Sonnet, GPT-4o) would fix it.
-
-2. **No bounding box citations**: `citation_bbox` is always null. Would need the LLM to return pixel coordinates, or a separate text-location matching step against the PDF layout.
-
-3. **Duplicate fields across pages**: Page headers (pump tag, service) appear on every page and get extracted multiple times. Post-processing handles dedup, but it's LLM-dependent.
-
-4. **No parallel extraction**: Pages are processed sequentially. Parallel LLM calls per page would cut time by 2-3x but risks rate limiting.
-
-5. **Synchronous API**: Extraction blocks the HTTP request for ~60s per document. Fine for 4 documents, but would need async job queue for production scale.
-
-6. **Local file storage**: Uploads and rendered pages are on local disk. Would need object storage (S3) for horizontal scaling.
+1. **Gemini Flash reliability** — returns empty responses ~20% of the time. Retry logic (3 attempts) mitigates but doesn't eliminate. Claude Sonnet or GPT-4o would fix this.
+2. **No parallel page extraction** — pages are processed sequentially. Parallel LLM calls would cut time by 2-3x.
+3. **Synchronous API** — extraction blocks the HTTP request for ~60s per document. Would need async job queue for production scale.
+4. **No bounding box citations** — `citation_bbox` is always null. Would need LLM to return coordinates or a text-location matching step.
+5. **Single-session gap analysis** — cross-document comparison only works within a session. Cross-session learning would need a global field registry.
+6. **Local file storage** — PDFs stored on local disk. Would need S3 for horizontal scaling.

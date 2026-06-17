@@ -1,12 +1,12 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, Eye, Search, RefreshCw } from 'lucide-react';
+import { ArrowLeft, Eye, Bot, RefreshCw } from 'lucide-react';
 import { api } from '../api/client';
 import type { Document, DocumentDetail, ExtractedField } from '../types';
 import DocumentSidebar from '../components/DocumentSidebar';
 import PageViewer from '../components/PageViewer';
 import FieldPanel from '../components/FieldPanel';
-import QueryPanel from '../components/QueryPanel';
+import AgentChat from '../components/AgentChat';
 
 type Mode = 'review' | 'query';
 
@@ -23,6 +23,7 @@ export default function SessionDetailPage() {
   const [filterSection, setFilterSection] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [reExtracting, setReExtracting] = useState(false);
+  const [injectedPrompt, setInjectedPrompt] = useState<string | null>(null);
 
   // Load documents
   const loadDocs = useCallback(async () => {
@@ -71,6 +72,21 @@ export default function SessionDetailPage() {
     setHighlightText(field.citation_text);
   }, []);
 
+  // Handle extraction complete — switch to agent and send report for LLM summarization
+  const handleExtractionComplete = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const { report } = await api.getExtractionReport(sessionId);
+      setMode('query');
+      setInjectedPrompt(report);
+      loadFields();
+    } catch {
+      setMode('query');
+      setInjectedPrompt('Extraction just completed. Please check the extraction gaps and give me a summary of the results.');
+      loadFields();
+    }
+  }, [sessionId, loadFields]);
+
   // Re-extract with corrections
   const handleReExtract = useCallback(async () => {
     if (!sessionId || !selectedDocId) return;
@@ -118,7 +134,7 @@ export default function SessionDetailPage() {
               mode === 'query' ? 'bg-primary-600 text-white' : 'text-gray-400 hover:text-gray-200'
             }`}
           >
-            <Search size={12} /> Query
+            <Bot size={12} /> Agent
           </button>
         </div>
 
@@ -157,12 +173,18 @@ export default function SessionDetailPage() {
           selectedDocId={selectedDocId}
           onSelectDoc={(id) => { setSelectedDocId(id); setSelectedFieldId(null); setHighlightText(null); }}
           onRefresh={loadDocs}
+          onExtractionComplete={handleExtractionComplete}
         />
 
         {/* Center: Page viewer or Query panel */}
         <div className="flex-1 min-w-0">
           {mode === 'query' ? (
-            <QueryPanel sessionId={sessionId} />
+            <AgentChat
+              sessionId={sessionId}
+              onFieldsChanged={loadFields}
+              injectedPrompt={injectedPrompt}
+              onPromptConsumed={() => setInjectedPrompt(null)}
+            />
           ) : selectedDoc ? (
             <PageViewer
               sessionId={sessionId}
