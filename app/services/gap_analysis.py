@@ -12,7 +12,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
-from app.models.document_page import DocumentPage
 from app.models.extracted_field import ExtractedField
 
 LOW_CONFIDENCE_THRESHOLD = 0.7
@@ -94,23 +93,13 @@ async def analyze_extraction_gaps(
         }
         report["total_fields"] += len(fields)
 
-        # Check for failed pages (content pages with 0 fields)
-        pages_stmt = (
-            select(DocumentPage)
-            .where(DocumentPage.document_id == doc.id)
-            .order_by(DocumentPage.page_number)
-        )
-        pages = (await db.execute(pages_stmt)).scalars().all()
-
-        for page in pages:
-            page_fields = [f for f in fields if f.citation_page == page.page_number]
-            if len(page_fields) == 0:
-                quality = page.extraction_quality.value if hasattr(page.extraction_quality, 'value') else str(page.extraction_quality)
+        # Check for pages with 0 fields extracted
+        all_citation_pages = {f.citation_page for f in fields}
+        for page_num in range(1, (doc.num_pages or 1) + 1):
+            if page_num not in all_citation_pages:
                 doc_report["failed_pages"].append({
-                    "page_number": page.page_number,
-                    "extraction_quality": quality,
-                    "text_length": len(page.raw_text),
-                    "reason": "No fields extracted — LLM returned empty or page processing failed",
+                    "page_number": page_num,
+                    "reason": "No fields extracted from this page",
                 })
                 report["total_failed_pages"] += 1
 

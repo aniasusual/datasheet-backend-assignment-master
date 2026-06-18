@@ -13,10 +13,7 @@ from enum import Enum
 
 class ExtractionPhase(str, Enum):
     queued = "queued"
-    discovery = "discovery"          # Pass 1
-    extracting_values = "extracting_values"  # Pass 2
-    verifying = "verifying"          # Pass 3
-    post_processing = "post_processing"
+    extracting = "extracting"
     done = "done"
     failed = "failed"
 

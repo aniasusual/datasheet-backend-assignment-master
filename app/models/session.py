@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, FullTimestampMixin, pk_uuid
 
 if TYPE_CHECKING:
+    from app.models.chat_message import ChatMessage
     from app.models.document import Document
     from app.models.equipment_entity import EquipmentEntity
 
@@ -30,4 +31,8 @@ class Session(Base, FullTimestampMixin):
     )
     entities: Mapped[list["EquipmentEntity"]] = relationship(
         "EquipmentEntity", back_populates="session", cascade="all, delete-orphan"
+    )
+    chat_messages: Mapped[list["ChatMessage"]] = relationship(
+        "ChatMessage", back_populates="session", cascade="all, delete-orphan",
+        order_by="ChatMessage.sequence",
     )

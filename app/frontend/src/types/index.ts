@@ -150,8 +150,11 @@ export interface ExtractionResult {
 
 // Agent
 export interface AgentMessage {
+  id?: string;
   role: 'user' | 'assistant';
   content: string;
+  tool_actions?: ToolAction[] | null;
+  created_at?: string | null;
 }
 
 export interface ToolAction {
@@ -162,39 +165,11 @@ export interface ToolAction {
 
 export interface AgentResponse {
   response: string;
-  messages: AgentMessage[];
   tool_actions: ToolAction[];
+  message_id: string;
 }
 
-// Extraction progress
-export interface DocumentExtractionProgress {
-  document_id: string;
-  filename: string;
-  total_pages: number;
-  current_page: number;
-  phase: 'queued' | 'discovery' | 'extracting_values' | 'verifying' | 'post_processing' | 'done' | 'failed';
-  fields_extracted: number;
-  error: string | null;
+export interface ChatHistoryResponse {
+  messages: AgentMessage[];
 }
 
-export interface ExtractionStatus {
-  status: 'idle' | 'running' | 'completed' | 'failed';
-  message?: string;
-  total_documents?: number;
-  documents_completed?: number;
-  elapsed_seconds?: number;
-  documents?: Record<string, DocumentExtractionProgress>;
-}
-
-// Section labels
-export const SECTION_LABELS: Record<string, string> = {
-  general_info: 'General Info',
-  product_handled: 'Product Handled',
-  operating_conditions: 'Operating Conditions',
-  pump_performance: 'Pump Performance',
-  construction_materials: 'Construction Materials',
-  mechanical_design: 'Mechanical Design',
-  motor_data: 'Motor Data',
-  weights_dimensions: 'Weights & Dimensions',
-  notes_remarks: 'Notes & Remarks',
-};

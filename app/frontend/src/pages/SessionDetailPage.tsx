@@ -72,19 +72,16 @@ export default function SessionDetailPage() {
     setHighlightText(field.citation_text);
   }, []);
 
-  // Handle extraction complete — switch to agent and send report for LLM summarization
+  // Handle extraction complete — switch to agent and ask it to analyze
   const handleExtractionComplete = useCallback(async () => {
     if (!sessionId) return;
-    try {
-      const { report } = await api.getExtractionReport(sessionId);
-      setMode('query');
-      setInjectedPrompt(report);
-      loadFields();
-    } catch {
-      setMode('query');
-      setInjectedPrompt('Extraction just completed. Please check the extraction gaps and give me a summary of the results.');
-      loadFields();
-    }
+    setMode('query');
+    setInjectedPrompt(
+      'Extraction just completed for all documents. Please analyze the extracted data: ' +
+      'summarize what was extracted from each document, identify any missing or low-confidence fields, ' +
+      'and suggest what I should review or correct.'
+    );
+    loadFields();
   }, [sessionId, loadFields]);
 
   // Re-extract with corrections

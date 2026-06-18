@@ -10,7 +10,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.extracted_field import ExtractedField, FieldStatus
-from app.models.field_correction import FieldCorrection
 
 from app.config import settings
 from app.database import get_db, async_session_factory
@@ -24,15 +23,6 @@ from app.schemas.documents import (
     DocumentUploadResponse,
 )
 from app.services.document_processor import process_document, detect_file_type
-from app.services.extraction_progress import (
-    ExtractionPhase,
-    start_session as start_progress,
-    update_document as update_doc_progress,
-    mark_document_done,
-    mark_document_failed,
-    finish_session,
-    get_progress,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -123,20 +113,13 @@ async def extract_document_fields(
         )
 
     from app.services.extraction import extract_document
-    from app.services.post_processing import post_process_document
 
-    fields = await extract_document(document_id, db)
-    entity = await post_process_document(document_id, session_id, db)
+    fields = await extract_document(document_id, db, session_id=session_id)
 
     return {
         "status": "completed",
         "document_id": str(document_id),
         "fields_extracted": len(fields),
-        "entity": {
-            "id": str(entity.id),
-            "tag": entity.tag,
-            "name": entity.name,
-        } if entity else None,
     }
 
 
@@ -149,9 +132,8 @@ async def re_extract_document(
     """Re-extract a document with HITL corrections injected into the prompt.
 
     1. Loads all past corrections for this document
-    2. Deletes existing extracted fields (corrections are preserved)
+    2. Deletes existing extracted fields and old entity
     3. Re-runs extraction with corrections as context
-    4. Re-runs post-processing
     """
     doc = await db.get(Document, document_id)
     if doc is None or doc.session_id != session_id:
@@ -201,75 +183,63 @@ async def re_extract_document(
     # 2. Delete old fields (cascade deletes corrections too)
     for f in old_fields:
         await db.delete(f)
+
+    # 3. Delete old entity linked to this document
+    from app.models.equipment_entity import EquipmentEntity
+    from app.models.entity_document import entity_documents as ed_table
+    ed_stmt = select(ed_table.c.entity_id).where(ed_table.c.document_id == document_id)
+    ed_result = await db.execute(ed_stmt)
+    old_entity_ids = [row[0] for row in ed_result.all()]
+    for eid in old_entity_ids:
+        old_entity = await db.get(EquipmentEntity, eid)
+        if old_entity:
+            await db.delete(old_entity)
+
     await db.flush()
 
-    # 3. Reset document status so extract_document accepts it
+    # 4. Reset document status so extract_document accepts it
     doc.status = DocumentStatus.uploaded
     await db.flush()
 
-    # 4. Re-extract with corrections context
-    from app.services.post_processing import post_process_document
-
-    fields = await extract_document(document_id, db, corrections_context=corrections_context)
-    entity = await post_process_document(document_id, session_id, db)
+    # 5. Re-extract with corrections context
+    fields = await extract_document(document_id, db, session_id=session_id, corrections_context=corrections_context)
 
     return {
         "status": "completed",
         "document_id": str(document_id),
         "fields_extracted": len(fields),
         "corrections_applied": len(corrections_data),
-        "entity": {
-            "id": str(entity.id),
-            "tag": entity.tag,
-            "name": entity.name,
-        } if entity else None,
     }
 
 
 async def _run_extraction_background(session_id: uuid.UUID, doc_infos: list[tuple[uuid.UUID, str, int]]) -> None:
     """Background coroutine that extracts all documents and updates progress."""
     from app.services.extraction import extract_document
-    from app.services.post_processing import post_process_document
-    from app.services.gap_analysis import analyze_extraction_gaps
 
-    sid = str(session_id)
-    doc_ids: list[uuid.UUID] = []
-
-    async with async_session_factory() as db:
-        try:
-            for doc_id, filename, _num_pages in doc_infos:
-                did = str(doc_id)
+    try:
+        for doc_id, filename, _num_pages in doc_infos:
+            async with async_session_factory() as db:
                 try:
-                    def make_progress_cb(d_id: str):
-                        def cb(page_number: int, phase: str):
-                            update_doc_progress(sid, d_id, phase=ExtractionPhase(phase), current_page=page_number)
-                        return cb
-
                     fields = await extract_document(
-                        doc_id, db, on_progress=make_progress_cb(did),
+                        doc_id, db, session_id=session_id,
                     )
-
-                    update_doc_progress(sid, did, phase=ExtractionPhase.post_processing)
-                    await post_process_document(doc_id, session_id, db)
-
-                    mark_document_done(sid, did, len(fields))
-                    doc_ids.append(doc_id)
+                    await db.commit()
+                    logger.info("Extracted %d fields from %s", len(fields), filename)
 
                 except Exception as exc:
                     logger.exception("Extraction failed for document %s", doc_id)
-                    mark_document_failed(sid, did, str(exc))
-                    # Continue with next document
+                    await db.rollback()
+                    try:
+                        doc = await db.get(Document, doc_id)
+                        if doc:
+                            doc.status = DocumentStatus.failed
+                            await db.commit()
+                    except Exception:
+                        pass
                     continue
 
-            await db.commit()
-
-            # Gap analysis (uses its own queries)
-            gap_report = await analyze_extraction_gaps(session_id, doc_ids, db) if doc_ids else None
-            finish_session(sid, status="completed", gap_report=gap_report)
-
-        except Exception as exc:
-            logger.exception("Background extraction failed for session %s", session_id)
-            finish_session(sid, status="failed")
+    except Exception:
+        logger.exception("Background extraction failed for session %s", session_id)
 
 
 @router.post("/extract-all")
@@ -277,14 +247,17 @@ async def extract_all_documents(
     session_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Start extraction for all uploaded documents. Returns immediately; poll /extraction-status for progress."""
+    """Start extraction for all uploaded documents. Returns immediately."""
     session = await db.get(Session, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Check if extraction is already running
-    existing = get_progress(str(session_id))
-    if existing and existing["status"] == "running":
+    # Check if any docs are already extracting
+    extracting_stmt = select(Document).where(
+        Document.session_id == session_id,
+        Document.status == DocumentStatus.extracting,
+    )
+    if (await db.execute(extracting_stmt)).scalars().first():
         raise HTTPException(status_code=409, detail="Extraction already in progress")
 
     stmt = (
@@ -301,9 +274,7 @@ async def extract_all_documents(
     if not docs:
         raise HTTPException(status_code=400, detail="No documents ready for extraction")
 
-    # Build doc info list and initialize progress
     doc_infos = [(doc.id, doc.filename, doc.num_pages) for doc in docs]
-    start_progress(str(session_id), [(str(d.id), d.filename, d.num_pages) for d in docs])
 
     # Launch background task
     asyncio.create_task(_run_extraction_background(session_id, doc_infos))
@@ -311,37 +282,8 @@ async def extract_all_documents(
     return {
         "status": "started",
         "documents_queued": len(docs),
-        "message": "Extraction started. Poll /extraction-status for progress.",
     }
 
-
-@router.get("/extraction-status")
-async def get_extraction_status(
-    session_id: uuid.UUID,
-):
-    """Poll extraction progress for a session."""
-    progress = get_progress(str(session_id))
-    if progress is None:
-        return {"status": "idle", "message": "No extraction in progress or recently completed."}
-    return progress
-
-
-@router.get("/extraction-report")
-async def get_extraction_report(
-    session_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db),
-):
-    """Get a formatted extraction report with gap analysis for all documents."""
-    session = await db.get(Session, session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    from app.services.gap_analysis import analyze_extraction_gaps, format_extraction_report
-
-    report = await analyze_extraction_gaps(session_id, None, db)
-    formatted = format_extraction_report(report)
-
-    return {"report": formatted, "raw": report}
 
 
 @router.get("", response_model=list[DocumentResponse])

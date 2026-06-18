@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Bot, User, Wrench, Loader2, Sparkles } from 'lucide-react';
+import { Send, Bot, User, Wrench, Loader2, Sparkles, Trash2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import { api } from '../api/client';
 import type { AgentMessage, ToolAction } from '../types';
@@ -25,14 +25,12 @@ function ToolActionBadge({ action }: { action: ToolAction }) {
     update_field: 'Updated field',
     verify_fields: 'Verified fields',
     reject_fields: 'Rejected fields',
-    get_page_text: 'Read page text',
   };
 
   const colors: Record<string, string> = {
     update_field: 'bg-blue-500/10 text-blue-400',
     verify_fields: 'bg-emerald-500/10 text-emerald-400',
     reject_fields: 'bg-red-500/10 text-red-400',
-    get_page_text: 'bg-gray-700/50 text-gray-300',
   };
 
   const result = action.result as Record<string, unknown>;
@@ -50,13 +48,31 @@ function ToolActionBadge({ action }: { action: ToolAction }) {
   );
 }
 
+const proseClasses = "prose prose-invert prose-sm max-w-none prose-p:my-1.5 prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5 prose-headings:my-2 prose-table:my-2 prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1 prose-pre:bg-gray-900 prose-pre:border prose-pre:border-gray-700 prose-code:text-primary-300";
+
 export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, onPromptConsumed }: Props) {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [toolActions, setToolActions] = useState<ToolAction[][]>([]);
+  const [initialLoading, setInitialLoading] = useState(true);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Load chat history from DB on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { messages: history } = await api.getChatHistory(sessionId);
+        if (!cancelled) setMessages(history);
+      } catch {
+        // ignore — fresh chat
+      } finally {
+        if (!cancelled) setInitialLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [sessionId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -64,23 +80,23 @@ export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, 
 
   const sendMessage = useCallback(async (text?: string) => {
     const msg = text || input.trim();
-    if (!msg) return;
+    if (!msg || loading) return;
     setInput('');
     setLoading(true);
 
-    // Optimistic: add user message
-    const prevMessages = messages;
+    // Optimistic: add user message to UI
     setMessages(prev => [...prev, { role: 'user', content: msg }]);
 
     try {
-      const result = await api.agentChat(
-        sessionId,
-        prevMessages.map(m => ({ role: m.role, content: m.content })),
-        msg,
-      );
+      const result = await api.agentChat(sessionId, msg);
 
-      setMessages(result.messages);
-      setToolActions(prev => [...prev, result.tool_actions]);
+      // Add the assistant response (with tool_actions attached)
+      const assistantMsg: AgentMessage = {
+        role: 'assistant',
+        content: result.response,
+        tool_actions: result.tool_actions.length > 0 ? result.tool_actions : null,
+      };
+      setMessages(prev => [...prev, assistantMsg]);
 
       // If any write actions were taken, refresh fields
       const hasWriteAction = result.tool_actions.some(
@@ -98,12 +114,12 @@ export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, 
       setLoading(false);
       inputRef.current?.focus();
     }
-  }, [sessionId, input, messages, onFieldsChanged]);
+  }, [sessionId, input, loading, onFieldsChanged]);
 
   // When extraction completes, send the report to the agent for LLM summarization
   const injectedRef = useRef(false);
   useEffect(() => {
-    if (injectedPrompt && !injectedRef.current) {
+    if (injectedPrompt && !injectedRef.current && !initialLoading) {
       injectedRef.current = true;
       const prompt = `Here is the extraction report. Summarize the key findings, highlight any issues, and suggest next steps:\n\n${injectedPrompt}`;
       sendMessage(prompt);
@@ -112,7 +128,7 @@ export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, 
     if (!injectedPrompt) {
       injectedRef.current = false;
     }
-  }, [injectedPrompt, onPromptConsumed, sendMessage]);
+  }, [injectedPrompt, onPromptConsumed, sendMessage, initialLoading]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -121,8 +137,23 @@ export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, 
     }
   };
 
-  // Count tool actions per assistant message
-  let toolActionIndex = 0;
+  const handleClearChat = useCallback(async () => {
+    if (!confirm('Clear all chat messages?')) return;
+    try {
+      await api.clearChat(sessionId);
+      setMessages([]);
+    } catch {
+      // ignore
+    }
+  }, [sessionId]);
+
+  if (initialLoading) {
+    return (
+      <div className="flex items-center justify-center h-full bg-[#0c0d12]">
+        <Loader2 size={24} className="text-primary-400 animate-spin" />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-full bg-[#0c0d12]">
@@ -155,15 +186,10 @@ export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, 
         ) : (
           <div className="max-w-3xl mx-auto px-4 py-4 space-y-4">
             {messages.map((msg, i) => {
-              // Get tool actions for this assistant message
-              let actions: ToolAction[] = [];
-              if (msg.role === 'assistant') {
-                actions = toolActions[toolActionIndex] || [];
-                toolActionIndex++;
-              }
+              const actions = msg.tool_actions || [];
 
               return (
-                <div key={i} className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
+                <div key={msg.id || i} className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
                   {msg.role === 'assistant' && (
                     <div className="w-7 h-7 rounded-lg bg-primary-600/10 flex items-center justify-center shrink-0 mt-0.5">
                       <Bot size={14} className="text-primary-400" />
@@ -183,13 +209,9 @@ export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, 
                         ? 'bg-primary-600 text-white'
                         : 'bg-[#1a1d27] text-gray-200 border border-gray-800'
                     }`}>
-                      {msg.role === 'assistant' ? (
-                        <div className="prose prose-invert prose-sm max-w-none prose-p:my-1.5 prose-ul:my-1.5 prose-ol:my-1.5 prose-li:my-0.5 prose-headings:my-2 prose-table:my-2 prose-th:px-2 prose-th:py-1 prose-td:px-2 prose-td:py-1 prose-pre:bg-gray-900 prose-pre:border prose-pre:border-gray-700 prose-code:text-primary-300">
-                          <ReactMarkdown>{msg.content}</ReactMarkdown>
-                        </div>
-                      ) : (
-                        <p className="whitespace-pre-wrap">{msg.content}</p>
-                      )}
+                      <div className={proseClasses}>
+                        <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      </div>
                     </div>
                   </div>
                   {msg.role === 'user' && (
@@ -227,15 +249,27 @@ export default function AgentChat({ sessionId, onFieldsChanged, injectedPrompt, 
             onKeyDown={handleKeyDown}
             placeholder="Ask about extracted data, or tell me to correct/verify/reject fields..."
             rows={1}
-            className="w-full bg-gray-900 border border-gray-700 rounded-xl pl-4 pr-12 py-3 text-sm text-gray-200 placeholder-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500/30 resize-none"
+            className="w-full bg-gray-900 border border-gray-700 rounded-xl pl-4 pr-20 py-3 text-sm text-gray-200 placeholder-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500/30 resize-none"
           />
-          <button
-            onClick={() => sendMessage()}
-            disabled={loading || !input.trim()}
-            className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-gray-500 hover:text-primary-400 disabled:opacity-30 disabled:hover:text-gray-500 transition-colors"
-          >
-            <Send size={16} />
-          </button>
+          <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+            {messages.length > 0 && (
+              <button
+                onClick={handleClearChat}
+                disabled={loading}
+                className="p-2 text-gray-600 hover:text-red-400 disabled:opacity-30 transition-colors"
+                title="Clear chat"
+              >
+                <Trash2 size={14} />
+              </button>
+            )}
+            <button
+              onClick={() => sendMessage()}
+              disabled={loading || !input.trim()}
+              className="p-2 text-gray-500 hover:text-primary-400 disabled:opacity-30 disabled:hover:text-gray-500 transition-colors"
+            >
+              <Send size={16} />
+            </button>
+          </div>
         </div>
       </div>
     </div>

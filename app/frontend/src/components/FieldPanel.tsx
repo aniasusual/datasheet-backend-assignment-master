@@ -2,7 +2,6 @@ import { useState, useCallback, useEffect, useRef } from 'react';
 import { Check, X, Pencil, ChevronDown, ChevronRight } from 'lucide-react';
 import { api } from '../api/client';
 import type { ExtractedField, FieldStatus } from '../types';
-import { SECTION_LABELS } from '../types';
 
 interface Props {
   sessionId: string;
@@ -159,14 +158,8 @@ export default function FieldPanel({
     (grouped[f.section] ??= []).push(f);
   }
 
-  // Only show sections that have extracted fields
-  const activeSections = [...new Set(fields.map(f => f.section))];
-  // Preserve a stable order: use SECTION_LABELS order for known sections, then any unknown ones
-  const knownOrder = Object.keys(SECTION_LABELS);
-  const sections = [
-    ...knownOrder.filter(s => activeSections.includes(s)),
-    ...activeSections.filter(s => !knownOrder.includes(s)),
-  ];
+  // Sections derived entirely from extracted data — no hardcoded list
+  const sections = [...new Set(fields.map(f => f.section))];
 
   return (
     <div className="w-96 bg-[#151821] border-l border-gray-800 flex flex-col h-full">
@@ -186,7 +179,7 @@ export default function FieldPanel({
           >
             <option value="">All sections</option>
             {sections.map(s => (
-              <option key={s} value={s}>{SECTION_LABELS[s] || s}</option>
+              <option key={s} value={s}>{s}</option>
             ))}
           </select>
           <select
@@ -221,7 +214,7 @@ export default function FieldPanel({
               >
                 {expandedSections.has(section) ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
                 <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
-                  {SECTION_LABELS[section] || section}
+                  {section}
                 </span>
                 <span className="text-[10px] text-gray-600 ml-auto">{grouped[section]?.length}</span>
               </button>

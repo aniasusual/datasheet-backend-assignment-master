@@ -29,9 +29,9 @@ import type {
   ExtractedField,
   EquipmentEntity,
   ExtractionResult,
-  ExtractionStatus,
   QueryResult,
   AgentResponse,
+  ChatHistoryResponse,
   FieldStatus,
 } from '../types';
 
@@ -79,25 +79,15 @@ export const api = {
     ),
 
   extractAll: (sessionId: string) =>
-    request<{ status: string; documents_queued: number; message: string }>(
+    request<{ status: string; documents_queued: number }>(
       `/sessions/${sessionId}/documents/extract-all`,
       { method: 'POST' }
-    ),
-
-  getExtractionStatus: (sessionId: string) =>
-    request<ExtractionStatus>(
-      `/sessions/${sessionId}/documents/extraction-status`
     ),
 
   reExtractDocument: (sessionId: string, docId: string) =>
     request<ExtractionResult>(
       `/sessions/${sessionId}/documents/${docId}/re-extract`,
       { method: 'POST' }
-    ),
-
-  getExtractionReport: (sessionId: string) =>
-    request<{ report: string; raw: unknown }>(
-      `/sessions/${sessionId}/documents/extraction-report`
     ),
 
   // Fields
@@ -165,10 +155,16 @@ export const api = {
       body: JSON.stringify({ question }),
     }),
 
-  // Agent
-  agentChat: (sessionId: string, messages: { role: string; content: string }[], message: string) =>
+  // Agent / Chat
+  getChatHistory: (sessionId: string) =>
+    request<ChatHistoryResponse>(`/sessions/${sessionId}/chat`),
+
+  clearChat: (sessionId: string) =>
+    request<{ status: string }>(`/sessions/${sessionId}/chat`, { method: 'DELETE' }),
+
+  agentChat: (sessionId: string, message: string) =>
     request<AgentResponse>(`/sessions/${sessionId}/agent`, {
       method: 'POST',
-      body: JSON.stringify({ messages, message }),
+      body: JSON.stringify({ message }),
     }),
 };

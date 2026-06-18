@@ -1,566 +1,233 @@
-"""Three-pass extraction pipeline.
+"""Single-call extraction pipeline.
 
-Pass 1: FIELD DISCOVERY — identify all field labels on the page (including empty)
-Pass 2: GUIDED EXTRACTION — extract values for each discovered field
-Pass 3: VERIFICATION — cross-check extracted values against raw text
+Send the entire PDF to Gemini, get JSON back with all fields + entity metadata.
+One LLM call per document. No tool_choice, no verification pass, no pdfplumber text.
 """
 
 import asyncio
 import base64
 import json
 import logging
+import re
 import uuid
-from pathlib import Path
 
-import fitz  # PyMuPDF
 import litellm
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.models.document import Document, DocumentStatus
-from app.models.document_page import DocumentPage
+from app.models.entity_document import entity_documents
+from app.models.equipment_entity import EquipmentEntity
 from app.models.extracted_field import ExtractedField, FieldDataType, FieldStatus
 
 logger = logging.getLogger(__name__)
 
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 4
+_llm_semaphore = asyncio.Semaphore(3)
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _extract_pdf_page(pdf_path: str, page_number: int) -> str:
-    """Extract a single page from a PDF as base64 PDF bytes.
+def _encode_full_pdf(file_path: str) -> str:
+    """Read entire PDF file and encode as base64."""
+    with open(file_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-    page_number is 1-indexed (matching our DocumentPage convention).
+
+def _parse_json_response(text: str) -> dict:
+    """Parse JSON from LLM response with fallbacks for markdown wrapping.
+
+    Tries:
+    1. Direct json.loads
+    2. Strip markdown fences (closed or unclosed)
+    3. Find first { to last }
+    4. Repair truncated JSON (close open braces/brackets)
     """
-    doc = fitz.open(pdf_path)
-    single = fitz.open()
-    single.insert_pdf(doc, from_page=page_number - 1, to_page=page_number - 1)
-    pdf_bytes = single.tobytes()
-    single.close()
-    doc.close()
-    return base64.b64encode(pdf_bytes).decode("utf-8")
+    text = text.strip()
 
-
-def _get_page_pdf_content(page: DocumentPage, document: Document) -> list[dict]:
-    """Return PDF content block for a page. Sends the actual PDF page, not a rendered image."""
+    # Try 1: direct parse
     try:
-        pdf_b64 = _extract_pdf_page(document.file_path, page.page_number)
-        return [{
-            "type": "image_url",
-            "image_url": {"url": f"data:application/pdf;base64,{pdf_b64}"},
-        }]
-    except Exception:
-        logger.warning("Failed to extract PDF page %d from %s", page.page_number, document.file_path)
-        return []
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try 2: strip markdown fences (closed)
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Try 2b: strip unclosed markdown fence (truncated response)
+    match = re.search(r"```(?:json)?\s*([\s\S]*)", text)
+    if match:
+        inner = match.group(1).strip().rstrip("`")
+        try:
+            return json.loads(inner)
+        except json.JSONDecodeError:
+            # Try repairing truncated JSON from the fence content
+            repaired = _repair_truncated_json(inner)
+            if repaired is not None:
+                return repaired
+
+    # Try 3: find first { to last }
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        try:
+            return json.loads(text[first:last + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Try 4: repair truncated JSON from raw text
+    first = text.find("{")
+    if first != -1:
+        repaired = _repair_truncated_json(text[first:])
+        if repaired is not None:
+            return repaired
+
+    raise ValueError(f"Could not parse JSON from LLM response: {text[:500]}")
 
 
-def _get_page_text_context(page: DocumentPage) -> str:
-    """Return text context for a page."""
-    parts = []
-    if page.raw_text and page.raw_text.strip():
-        parts.append(f"## Raw Text\n{page.raw_text}")
-    if page.layout_text and page.layout_text.strip():
-        parts.append(f"## Layout Text\n{page.layout_text}")
-    if page.tables_json:
-        parts.append(f"## Tables\n{json.dumps(page.tables_json)}")
-    return "\n\n".join(parts) if parts else ""
+def _repair_truncated_json(text: str) -> dict | None:
+    """Attempt to repair truncated JSON by closing open structures.
 
+    Works by removing the last incomplete element and closing all open braces/brackets.
+    """
+    # Remove any trailing incomplete string/value (after last comma or opening bracket)
+    # Find the last complete element boundary
+    for trim in range(min(200, len(text)), 0, -1):
+        candidate = text[:len(text) - trim]
+        # Remove trailing comma, whitespace
+        candidate = candidate.rstrip().rstrip(",").rstrip()
 
-async def _llm_call(messages: list[dict], tools: list[dict] | None = None,
-                    tool_choice: dict | None = None, max_tokens: int = 8192) -> dict | None:
-    """Make an LLM call with retry logic. Returns the message or None."""
-    for attempt in range(MAX_ATTEMPTS):
-        response = await litellm.acompletion(
-            model=settings.LLM_MODEL,
-            api_key=settings.LLM_API_KEY or settings.GEMINI_API_KEY,
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            max_tokens=max_tokens,
-        )
+        # Count open/close braces and brackets
+        open_braces = candidate.count("{") - candidate.count("}")
+        open_brackets = candidate.count("[") - candidate.count("]")
 
-        if response.choices:
-            msg = response.choices[0].message
-            # If we need a tool call, check we got one
-            if tool_choice and not msg.tool_calls:
-                logger.warning("Attempt %d/%d: no tool call, retrying", attempt + 1, MAX_ATTEMPTS)
-                if attempt < MAX_ATTEMPTS - 1:
-                    await asyncio.sleep(2)
+        if open_braces >= 0 and open_brackets >= 0:
+            # Close all open structures
+            candidate += "]" * open_brackets + "}" * open_braces
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, dict) and "fields" in result:
+                    logger.warning("Repaired truncated JSON — %d fields recovered", len(result.get("fields", [])))
+                    return result
+            except json.JSONDecodeError:
                 continue
-            usage = response.usage
-            logger.info("LLM call: input=%d, output=%d tokens",
-                        getattr(usage, 'prompt_tokens', 0),
-                        getattr(usage, 'completion_tokens', 0))
-            return msg
-
-        logger.warning("Attempt %d/%d: empty response, retrying", attempt + 1, MAX_ATTEMPTS)
-        if attempt < MAX_ATTEMPTS - 1:
-            await asyncio.sleep(2)
 
     return None
 
-
-def _parse_tool_args(message) -> dict:
-    """Extract the first tool call's arguments from a message."""
-    if message and message.tool_calls:
-        for tc in message.tool_calls:
-            try:
-                return json.loads(tc.function.arguments)
-            except json.JSONDecodeError:
-                pass
-    return {}
-
-
-# ===========================================================================
-# PASS 1: FIELD DISCOVERY
-# ===========================================================================
-
-DISCOVERY_SYSTEM_PROMPT = """You are a document structure analyst for industrial/engineering datasheets.
-
-Your job is to:
-1. Classify what kind of page this is
-2. Identify EVERY field label on the page — including fields where the value cell is empty
-
-## Field Discovery
-For each field on the page, report:
-- label: the exact text of the field label as it appears
-- has_value: whether the value cell has actual data (true) or is empty/blank/dash (false)
-- section: categorize into one of the sections below
-- location_hint: brief description of where on the page
-
-## Document Metadata
-If visible on this page, also report:
-- equipment_tag: the equipment identifier (e.g., "P-718(A/B)", "HX-101", "C-450")
-- equipment_type: what kind of equipment (e.g., "pump", "heat_exchanger", "compressor")
-- service_name: the service description (e.g., "DIESEL PRODUCT PUMPS")
-- language: primary language of the document ("english", "french", "bilingual", etc.)
-
-## Sections
-- general_info, product_handled, operating_conditions, pump_performance
-- construction_materials, mechanical_design, motor_data, weights_dimensions, notes_remarks
-
-## Rules
-- Include EVERY field label, even if the value is empty
-- For bilingual documents, use the English label when both languages are present
-- Include notes/remarks section fields
-- Do NOT include decorative text or repeated page headers
-"""
-
-DISCOVERY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "report_page_analysis",
-        "description": "Report page classification, document metadata, and all field labels found",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "equipment_tag": {
-                    "type": "string",
-                    "description": "Equipment identifier if visible (e.g., 'P-718(A/B)', 'HX-101'). Empty if not found.",
-                },
-                "equipment_type": {
-                    "type": "string",
-                    "description": "Type of equipment (e.g., 'pump', 'heat_exchanger', 'compressor'). Empty if not determinable.",
-                },
-                "service_name": {
-                    "type": "string",
-                    "description": "Service/description (e.g., 'DIESEL PRODUCT PUMPS'). Empty if not found.",
-                },
-                "language": {
-                    "type": "string",
-                    "enum": ["english", "french", "bilingual", "other"],
-                    "description": "Primary language of the document content",
-                },
-                "fields": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "label": {"type": "string", "description": "Exact field label text"},
-                            "has_value": {"type": "boolean", "description": "Whether the value cell has data"},
-                            "section": {
-                                "type": "string",
-                                "enum": [
-                                    "general_info", "product_handled", "operating_conditions",
-                                    "pump_performance", "construction_materials", "mechanical_design",
-                                    "motor_data", "weights_dimensions", "notes_remarks",
-                                ],
-                            },
-                            "location_hint": {"type": "string", "description": "Where on the page"},
-                        },
-                        "required": ["label", "has_value", "section"],
-                    },
-                },
-            },
-            "required": ["fields"],
-        },
-    },
-}
-
-
-async def pass1_discover_fields(page: DocumentPage, document: Document) -> dict:
-    """Pass 1: Discover all field labels on the page + classify page + extract metadata.
-
-    Returns dict with: fields, equipment_tag, equipment_type, service_name, language
-    """
-    content = _get_page_pdf_content(page, document)
-    text_ctx = _get_page_text_context(page)
-    content.append({
-        "type": "text",
-        "text": (
-            f"Analyze page {page.page_number} of '{document.filename}'.\n"
-            f"1. Identify any equipment tag, type, and service name visible\n"
-            f"2. List EVERY field label, including empty fields\n\n{text_ctx}"
-        ),
-    })
-
-    msg = await _llm_call(
-        messages=[
-            {"role": "system", "content": DISCOVERY_SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
-        tools=[DISCOVERY_TOOL],
-        tool_choice={"type": "function", "function": {"name": "report_page_analysis"}},
-        max_tokens=8192,
-    )
-
-    args = _parse_tool_args(msg)
-    fields = args.get("fields", [])
-
-    logger.info("Pass 1: page %d, %d fields, tag=%s",
-                page.page_number, len(fields),
-                args.get("equipment_tag", ""))
-
-    return {
-        "fields": fields,
-        "equipment_tag": args.get("equipment_tag", ""),
-        "equipment_type": args.get("equipment_type", ""),
-        "service_name": args.get("service_name", ""),
-        "language": args.get("language", ""),
-    }
-
-
-# ===========================================================================
-# PASS 2: GUIDED EXTRACTION
-# ===========================================================================
-
-EXTRACTION_SYSTEM_PROMPT = """You are a precision data extractor for industrial process datasheets.
-
-You will receive a page image and a LIST OF SPECIFIC FIELDS to extract. Extract the value for each field on the list.
-
-## Rules
-1. Preserve exact values — do not round, convert, or calculate
-2. Separate units from values: "928 GPM" → value: "928", unit: "GPM"
-3. For bilingual content, use English display names
-4. Include footnote references in note_refs (e.g., "(3)" → note_refs: ["3"])
-5. citation_text must be the exact text from the document showing label + value
-6. For fields marked has_value: false (empty/blank/dash), still include them with raw_value set to "" (empty string). These represent fields that exist on the datasheet but have no value filled in — we need to track them.
-7. Confidence: 0.9+ clearly readable, 0.7-0.9 partially obscured, <0.7 uncertain, 1.0 for empty fields (we are certain the field is empty)
-
-## French→English mappings
-DÉBIT→Flowrate, PRESSION→Pressure, ASPIRATION→Suction, REFOULEMENT→Discharge,
-HAUTEUR MANO→Differential Head, MASSE VOL→Density, VISCOSITE→Viscosity,
-TENSION DE VAPEUR→Vapor Pressure, ROUE→Impeller, CORPS→Inner Case,
-ARBRE→Shaft, GARNITURE MECANIQUE→Mechanical Seal, PALIER→Bearing,
-MOTEUR FOURNI PAR→Motor Supplied By, REMARQUES→Remarks
-"""
-
-EXTRACTION_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "save_extracted_fields",
-        "description": "Save extracted field values. Call once with all fields.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "fields": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "field_name": {"type": "string", "description": "Normalized snake_case identifier"},
-                            "display_name": {"type": "string", "description": "Human-readable name"},
-                            "raw_value": {"type": "string", "description": "Exact value from document"},
-                            "unit": {"type": "string", "description": "Unit of measurement, empty if none"},
-                            "section": {
-                                "type": "string",
-                                "enum": [
-                                    "general_info", "product_handled", "operating_conditions",
-                                    "pump_performance", "construction_materials", "mechanical_design",
-                                    "motor_data", "weights_dimensions", "notes_remarks",
-                                ],
-                            },
-                            "data_type": {"type": "string", "enum": ["numeric", "text", "boolean"]},
-                            "confidence": {"type": "number"},
-                            "citation_text": {"type": "string"},
-                            "note_refs": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": ["field_name", "display_name", "raw_value", "section", "data_type", "confidence", "citation_text"],
-                    },
-                },
-            },
-            "required": ["fields"],
-        },
-    },
-}
-
-
-async def pass2_extract_values(
-    page: DocumentPage,
-    document: Document,
-    discovered_fields: list[dict],
-    corrections_context: str = "",
-) -> list[dict]:
-    """Pass 2: Extract values for the discovered fields."""
-    # Build the field list for the prompt — include ALL discovered fields, even empty ones
-    if not discovered_fields:
-        logger.info("Pass 2: no fields discovered on doc %s page %d", document.id, page.page_number)
-        return []
-
-    field_list = "\n".join(
-        f"- {f['label']} (section: {f.get('section', 'unknown')}, location: {f.get('location_hint', 'unknown')}, has_value: {f.get('has_value', True)})"
-        for f in discovered_fields
-    )
-
-    content = _get_page_pdf_content(page, document)
-    text_ctx = _get_page_text_context(page)
-    content.append({
-        "type": "text",
-        "text": (
-            f"Extract values for these specific fields from page {page.page_number} "
-            f"of '{document.filename}' (pump: {document.pump_tag or 'unknown'}):\n\n"
-            f"{field_list}\n\n{text_ctx}"
-        ),
-    })
-
-    system = EXTRACTION_SYSTEM_PROMPT + corrections_context
-
-    msg = await _llm_call(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": content},
-        ],
-        tools=[EXTRACTION_TOOL],
-        tool_choice={"type": "function", "function": {"name": "save_extracted_fields"}},
-        max_tokens=8192,
-    )
-
-    args = _parse_tool_args(msg)
-    fields = args.get("fields", [])
-    logger.info("Pass 2: extracted %d field values on doc %s page %d", len(fields), document.id, page.page_number)
-    return fields
-
-
-# ===========================================================================
-# PASS 3: VERIFICATION
-# ===========================================================================
-
-VERIFICATION_SYSTEM_PROMPT = """You are a quality assurance specialist for extracted datasheet fields.
-
-You will receive extracted fields and the raw text from the page. Your job is to verify each field's value against the text.
-
-For each field, check:
-1. Does the raw_value match what's in the text?
-2. Is the unit correct and properly separated?
-3. Is the field_name/display_name accurate for this value?
-4. Is the section categorization correct?
-
-Report issues only — fields that pass verification don't need to be listed.
-"""
-
-VERIFICATION_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "report_verification",
-        "description": "Report verification results",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "issues": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "field_name": {"type": "string"},
-                            "issue_type": {
-                                "type": "string",
-                                "enum": ["wrong_value", "wrong_unit", "wrong_section", "hallucinated", "misread"],
-                            },
-                            "current_value": {"type": "string"},
-                            "correct_value": {"type": "string"},
-                            "current_unit": {"type": "string"},
-                            "correct_unit": {"type": "string"},
-                            "explanation": {"type": "string"},
-                        },
-                        "required": ["field_name", "issue_type", "explanation"],
-                    },
-                },
-                "verified_count": {"type": "integer", "description": "Number of fields that passed verification"},
-            },
-            "required": ["issues", "verified_count"],
-        },
-    },
-}
-
-
-async def pass3_verify(
-    page: DocumentPage,
-    extracted_fields: list[dict],
-) -> list[dict]:
-    """Pass 3: Verify extracted values against raw text. Text-only, no image (cheap)."""
-    if not extracted_fields or not page.raw_text.strip():
-        return []
-
-    fields_json = json.dumps(extracted_fields, indent=2)
-
-    msg = await _llm_call(
-        messages=[
-            {"role": "system", "content": VERIFICATION_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"## Extracted Fields\n{fields_json}\n\n"
-                f"## Raw Text from Page {page.page_number}\n{page.raw_text}\n\n"
-                f"## Layout Text\n{page.layout_text or '(not available)'}\n\n"
-                "Verify each field against the text. Report any mismatches."
-            )},
-        ],
-        tools=[VERIFICATION_TOOL],
-        tool_choice={"type": "function", "function": {"name": "report_verification"}},
-        max_tokens=4096,
-    )
-
-    args = _parse_tool_args(msg)
-    issues = args.get("issues", [])
-    verified = args.get("verified_count", 0)
-    logger.info("Pass 3: %d issues found, %d verified on doc page %d", len(issues), verified, page.page_number)
-    return issues
-
-
-# ===========================================================================
-# Apply verification fixes
-# ===========================================================================
-
-def _apply_verification(extracted: list[dict], issues: list[dict]) -> list[dict]:
-    """Apply verification fixes to extracted fields."""
-    issue_map = {}
-    for issue in issues:
-        name = issue.get("field_name", "")
-        issue_map[name] = issue
-
-    result = []
-    for field in extracted:
-        fname = field.get("field_name", "")
-        issue = issue_map.get(fname)
-
-        if issue:
-            itype = issue.get("issue_type", "")
-
-            if itype == "hallucinated":
-                logger.info("Removing hallucinated field: %s", fname)
-                continue  # drop it
-
-            if itype in ("wrong_value", "misread") and issue.get("correct_value"):
-                field["raw_value"] = issue["correct_value"]
-                field["confidence"] = min(field.get("confidence", 0.8), 0.75)
-                logger.info("Corrected value for %s: %s → %s", fname, issue.get("current_value"), issue["correct_value"])
-
-            if itype == "wrong_unit" and issue.get("correct_unit"):
-                field["unit"] = issue["correct_unit"]
-                logger.info("Corrected unit for %s: %s → %s", fname, issue.get("current_unit"), issue["correct_unit"])
-
-            if itype == "wrong_section":
-                # Lower confidence but keep it
-                field["confidence"] = min(field.get("confidence", 0.8), 0.7)
-
-        result.append(field)
-
-    return result
-
-
-# ===========================================================================
-# Parse helpers
-# ===========================================================================
 
 def _parse_data_type(dt: str) -> FieldDataType:
     return {"numeric": FieldDataType.numeric, "text": FieldDataType.text,
             "boolean": FieldDataType.boolean}.get(dt, FieldDataType.text)
 
 
-# ===========================================================================
-# Page-level orchestrator (all 3 passes)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# LLM call with retries
+# ---------------------------------------------------------------------------
 
-async def extract_page(
-    page: DocumentPage,
-    document: Document,
-    db: AsyncSession,
-    corrections_context: str = "",
-    on_phase: object = None,
-) -> tuple[list[ExtractedField], dict]:
-    """Run all 3 passes on a page. Returns (created fields, discovery result).
+async def _llm_call(messages: list[dict], max_tokens: int = 16384) -> str:
+    """Make an LLM call, return the response text. Retries on failure.
 
-    Discovery result contains: fields, equipment_tag, equipment_type, etc.
-    If Pass 1 discovers no fields with values, Pass 2 naturally returns empty.
-    on_phase: optional callable(phase_str) to report progress.
+    Raises ValueError if all attempts fail.
     """
-    _report = on_phase if callable(on_phase) else (lambda p: None)
+    last_error = None
 
-    # Pass 1: Discover fields + extract metadata
-    _report("discovery")
-    discovery = await pass1_discover_fields(page, document)
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            async with _llm_semaphore:
+                response = await litellm.acompletion(
+                    model=settings.LLM_MODEL,
+                    api_key=settings.LLM_API_KEY or settings.GEMINI_API_KEY,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                )
+        except Exception as exc:
+            last_error = exc
+            exc_str = str(exc).lower()
+            if any(kw in exc_str for kw in ("rate", "limit", "quota", "429", "500", "503", "resource")):
+                wait = (2 ** attempt) * 3
+                logger.warning("Attempt %d/%d: rate limit/server error, waiting %ds: %s",
+                               attempt + 1, MAX_ATTEMPTS, wait, exc)
+                await asyncio.sleep(wait)
+                continue
+            else:
+                logger.warning("Attempt %d/%d: LLM error: %s", attempt + 1, MAX_ATTEMPTS, exc)
+                await asyncio.sleep(2)
+                continue
 
-    # Pass 2: Extract values (using discovered fields)
-    _report("extracting_values")
-    raw_extracted = await pass2_extract_values(page, document, discovery["fields"], corrections_context)
+        if response.choices and response.choices[0].message.content:
+            content = response.choices[0].message.content
+            usage = response.usage
+            logger.info("LLM call: input=%d, output=%d tokens",
+                        getattr(usage, 'prompt_tokens', 0),
+                        getattr(usage, 'completion_tokens', 0))
+            return content
 
-    # Pass 3: Verify (only if we have text to check against)
-    if raw_extracted and page.raw_text and page.raw_text.strip():
-        _report("verifying")
-        issues = await pass3_verify(page, raw_extracted)
-        final_fields = _apply_verification(raw_extracted, issues)
-    else:
-        final_fields = raw_extracted
+        logger.warning("Attempt %d/%d: empty response, retrying", attempt + 1, MAX_ATTEMPTS)
+        last_error = ValueError("Empty LLM response")
+        await asyncio.sleep(2)
 
-    # Save to DB — truncate strings to fit column limits
-    created: list[ExtractedField] = []
-    for field_data in final_fields:
-        unit = field_data.get("unit")
-        if unit == "":
-            unit = None
-        if unit and len(unit) > 50:
-            unit = unit[:50]
-
-        field = ExtractedField(
-            document_id=document.id,
-            field_name=field_data.get("field_name", "unknown")[:255],
-            display_name=field_data.get("display_name", "Unknown")[:255],
-            raw_value=field_data.get("raw_value", ""),
-            unit=unit,
-            data_type=_parse_data_type(field_data.get("data_type", "text")),
-            section=field_data.get("section", "general_info")[:100],
-            confidence=field_data.get("confidence", 0.8),
-            status=FieldStatus.extracted,
-            citation_page=page.page_number,
-            citation_text=field_data.get("citation_text", ""),
-            citation_bbox=None,
-        )
-        db.add(field)
-        created.append(field)
-
-    logger.info(
-        "Page %d complete: %d discovered, %d extracted, %d saved",
-        page.page_number, len(discovery["fields"]), len(raw_extracted), len(created),
-    )
-
-    return created, discovery
+    raise ValueError(f"LLM call failed after {MAX_ATTEMPTS} attempts. Last error: {last_error}")
 
 
-# ===========================================================================
-# Document-level orchestrator
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Extraction prompt
+# ---------------------------------------------------------------------------
+
+EXTRACTION_SYSTEM_PROMPT = """You are a precision data extractor for industrial/engineering process datasheets.
+
+You will receive a PDF document. Extract ALL fields from ALL pages and return them as JSON.
+
+## Output Format
+You MUST respond with ONLY a valid JSON object. No markdown fences, no explanation, no text before or after.
+
+The JSON must have this structure:
+{
+  "equipment_tag": "P-718(A/B)",
+  "equipment_type": "pump",
+  "service_name": "DIESEL PRODUCT PUMPS",
+  "language": "english",
+  "entity_metadata": {"project": "...", "revision": "...", "date": "..."},
+  "fields": [
+    {
+      "field_name": "suction_pressure_normal",
+      "display_name": "Suction Pressure (Normal)",
+      "raw_value": "3.5",
+      "unit": "kg/cm²g",
+      "section": "Operating Conditions",
+      "data_type": "numeric",
+      "confidence": 0.95,
+      "citation_text": "Suction Pressure Normal: 3.5 kg/cm²g",
+      "citation_page": 1
+    }
+  ]
+}
+
+## Rules
+1. Preserve exact values — do not round, convert, or calculate
+2. Separate units from values: "928 GPM" → value: "928", unit: "GPM"
+3. Preserve the ORIGINAL language of the document — if a field label is in French, keep it in French. Do NOT translate anything. The display_name, field_name, and all text must match the language used in the document exactly.
+4. citation_text must be the exact text from the document showing label + value
+5. For empty fields (blank/dash/no value), include them with raw_value set to "" (empty string)
+6. Confidence: 0.9+ clearly readable, 0.7-0.9 partially obscured, <0.7 uncertain, 1.0 for confirmed empty fields
+7. Include EVERY field label on every page, even if the value is empty
+8. Do NOT include decorative text or repeated page headers
+9. citation_page is 1-indexed
+10. field_name must be normalized snake_case (transliterate accented characters, e.g. "débit" → "debit")
+11. For the "section" field, use the actual section heading from the document as it appears. Do not use hardcoded categories — derive the section name from the document's own structure and headings.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Corrections context (for re-extraction with HITL feedback)
+# ---------------------------------------------------------------------------
 
 def _build_corrections_context(corrections: list[dict]) -> str:
     if not corrections:
@@ -580,20 +247,21 @@ def _build_corrections_context(corrections: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Main extraction function — 1 LLM call per document
+# ---------------------------------------------------------------------------
+
 async def extract_document(
     document_id: uuid.UUID,
     db: AsyncSession,
+    session_id: uuid.UUID | None = None,
     corrections_context: str = "",
-    on_progress: object = None,
 ) -> list[ExtractedField]:
-    """Extract all fields from a document using the three-pass pipeline.
+    """Extract all fields from a document in a single LLM call.
 
-    Returns all created ExtractedField records.
-    Also stores discovered field labels in document metadata for gap analysis.
-    on_progress: optional callable(page_number, phase_str) for progress reporting.
+    Sends the raw PDF to Gemini, gets JSON back, creates ExtractedField
+    and EquipmentEntity records.
     """
-    _report = on_progress if callable(on_progress) else (lambda p, ph: None)
-
     document = await db.get(Document, document_id)
     if document is None:
         raise ValueError(f"Document {document_id} not found")
@@ -605,40 +273,101 @@ async def extract_document(
     await db.flush()
 
     try:
-        stmt = (
-            select(DocumentPage)
-            .where(DocumentPage.document_id == document_id)
-            .order_by(DocumentPage.page_number)
+        # Build the message: PDF + simple instruction
+        pdf_b64 = _encode_full_pdf(document.file_path)
+
+        system = EXTRACTION_SYSTEM_PROMPT + corrections_context
+
+        content: list[dict] = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:application/pdf;base64,{pdf_b64}"},
+            },
+            {
+                "type": "text",
+                "text": f"Extract ALL fields from this {document.num_pages}-page document: '{document.filename}'. Respond with ONLY JSON.",
+            },
+        ]
+
+        # Single LLM call
+        response_text = await _llm_call(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": content},
+            ],
+            max_tokens=65536,
         )
-        pages = (await db.execute(stmt)).scalars().all()
 
+        # Parse JSON response
+        data = _parse_json_response(response_text)
+        raw_fields = data.get("fields", [])
+
+        # Update document metadata
+        if data.get("equipment_tag"):
+            document.pump_tag = data["equipment_tag"][:100]
+        lang = data.get("language", "")
+        if lang:
+            if lang in ("french", "bilingual"):
+                document.format_type = "french_form"
+            elif lang == "english":
+                document.format_type = "english_tabular"
+            else:
+                document.format_type = lang
+
+        # Create EquipmentEntity if we have a tag and session_id
+        entity = None
+        if session_id and data.get("equipment_tag"):
+            entity = EquipmentEntity(
+                session_id=session_id,
+                tag=data["equipment_tag"][:100],
+                entity_type=data.get("equipment_type", "pump")[:100],
+                name=data.get("service_name", "")[:255],
+                metadata_json=data.get("entity_metadata"),
+            )
+            db.add(entity)
+            await db.flush()
+
+            # Link entity to document
+            await db.execute(
+                entity_documents.insert().values(
+                    entity_id=entity.id,
+                    document_id=document_id,
+                )
+            )
+
+        # Create ExtractedField records
         all_fields: list[ExtractedField] = []
-        all_discoveries: list[dict] = []
+        for field_data in raw_fields:
+            unit = field_data.get("unit")
+            if unit == "":
+                unit = None
+            if unit and len(unit) > 50:
+                unit = unit[:50]
 
-        for page in pages:
-            page_phase_cb = lambda phase, _pn=page.page_number: _report(_pn, phase)
-            created, discovery = await extract_page(page, document, db, corrections_context, on_phase=page_phase_cb)
-            all_fields.extend(created)
-            all_discoveries.append(discovery)
-
-            # Update document metadata from first content page that has it
-            if not document.pump_tag and discovery.get("equipment_tag"):
-                document.pump_tag = discovery["equipment_tag"][:100]
-            if not document.format_type and discovery.get("language"):
-                lang = discovery["language"]
-                if lang in ("french", "bilingual"):
-                    document.format_type = "french_form"
-                elif lang == "english":
-                    document.format_type = "english_tabular"
-                else:
-                    document.format_type = lang
+            field = ExtractedField(
+                document_id=document.id,
+                entity_id=entity.id if entity else None,
+                field_name=field_data.get("field_name", "unknown")[:255],
+                display_name=field_data.get("display_name", "Unknown")[:255],
+                raw_value=field_data.get("raw_value", ""),
+                unit=unit,
+                data_type=_parse_data_type(field_data.get("data_type", "text")),
+                section=field_data.get("section", "general_info")[:100],
+                confidence=field_data.get("confidence", 0.8),
+                status=FieldStatus.extracted,
+                citation_page=field_data.get("citation_page", 1),
+                citation_text=field_data.get("citation_text", ""),
+                citation_bbox=None,
+            )
+            db.add(field)
+            all_fields.append(field)
 
         document.status = DocumentStatus.extracted
         await db.flush()
 
         logger.info(
-            "Extraction complete for doc %s: %d fields from %d pages, tag=%s",
-            document_id, len(all_fields), len(pages), document.pump_tag,
+            "Extraction complete for doc %s: %d fields, tag=%s",
+            document_id, len(all_fields), document.pump_tag,
         )
 
         return all_fields

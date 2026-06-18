@@ -18,7 +18,6 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.models.document import Document
-from app.models.document_page import DocumentPage
 from app.models.extracted_field import ExtractedField, FieldStatus
 from app.models.field_correction import FieldCorrection
 
@@ -104,7 +103,6 @@ You have access to ALL extracted data from the datasheets below. Use this data t
 4. **Correct fields** — use update_field tool when the user points out errors
 5. **Verify fields** — use verify_fields tool when the user confirms data is correct
 6. **Reject fields** — use reject_fields tool to mark junk/irrelevant fields
-7. **Read raw page text** — use get_page_text when you need to see the original document content that may not have been extracted as fields
 
 ## Guidelines:
 - Always cite specific values with their source document, page number, and confidence level
@@ -189,27 +187,6 @@ AGENT_TOOLS = [
                     },
                 },
                 "required": ["field_ids"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_page_text",
-            "description": "Get the raw text, layout text, and tables for a specific page of a document. Use when you need to see original document content that wasn't captured in extracted fields.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "document_id": {
-                        "type": "string",
-                        "description": "Document UUID",
-                    },
-                    "page_number": {
-                        "type": "integer",
-                        "description": "Page number (1-indexed)",
-                    },
-                },
-                "required": ["document_id", "page_number"],
             },
         },
     },
@@ -325,43 +302,10 @@ async def _exec_reject_fields(
     return json.dumps({"rejected": rejected, "reason": args.get("reason", "")})
 
 
-async def _exec_get_page_text(
-    session_id: uuid.UUID, args: dict, db: AsyncSession
-) -> str:
-    doc_id = args.get("document_id")
-    page_num = args.get("page_number")
-    if not doc_id or not page_num:
-        return json.dumps({"error": "document_id and page_number are required"})
-
-    doc = await db.get(Document, uuid.UUID(doc_id))
-    if not doc or doc.session_id != session_id:
-        return json.dumps({"error": "Document not found in this session"})
-
-    stmt = select(DocumentPage).where(
-        DocumentPage.document_id == uuid.UUID(doc_id),
-        DocumentPage.page_number == page_num,
-    )
-    page = (await db.execute(stmt)).scalar_one_or_none()
-
-    if not page:
-        return json.dumps({"error": f"Page {page_num} not found"})
-
-    return json.dumps({
-        "document": doc.filename,
-        "pump_tag": doc.pump_tag,
-        "page_number": page.page_number,
-        "raw_text": page.raw_text[:8000] if page.raw_text else "",
-        "layout_text": page.layout_text[:8000] if page.layout_text else None,
-        "has_tables": bool(page.tables_json),
-        "tables": page.tables_json if page.tables_json else None,
-    })
-
-
 TOOL_EXECUTORS = {
     "update_field": _exec_update_field,
     "verify_fields": _exec_verify_fields,
     "reject_fields": _exec_reject_fields,
-    "get_page_text": _exec_get_page_text,
 }
 
 

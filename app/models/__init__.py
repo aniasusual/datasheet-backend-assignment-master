@@ -1,4 +1,5 @@
 from app.models.base import Base
+from app.models.chat_message import ChatMessage, ChatRole
 from app.models.document import Document, DocumentStatus
 from app.models.document_page import DocumentPage, ExtractionQuality
 from app.models.entity_document import entity_documents
@@ -9,6 +10,8 @@ from app.models.session import Session, SessionStatus
 
 __all__ = [
     "Base",
+    "ChatMessage",
+    "ChatRole",
     "Session",
     "SessionStatus",
     "Document",
